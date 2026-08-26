@@ -1,0 +1,23 @@
+# Go
+/out/
+*.exe
+*.test
+*.out
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+
+# Local secrets / temp
+*.tmp
+.env
+
+# Build artifacts (HA addon build produces these outside repo)
+build/
+dist/

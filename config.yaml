@@ -1,0 +1,45 @@
+name: "AI Proxy"
+version: "0.1.0"
+slug: "ai-proxy"
+description: "多平台 AI 账号（WorkBuddy/CodeBuddy + TraeWork）聚合为 OpenAI 兼容 API，模型带来源前缀自动路由；自动签到、多账号轮转。"
+url: "https://github.com/rockswang/workbuddy-wild"
+arch:
+  - aarch64
+  - amd64
+startup: "application"
+boot: "auto"
+ingress: true
+panel_icon: "mdi:server-network"
+# ingress 与管理 UI、OpenAI API 都走 7863（统一入口）
+ingress_port: 7863
+panel_title: "AI Proxy 管理"
+homeassistant: "2024.1.0"
+hassio_api: true
+hassio_role: "default"
+host_network: false
+ports:
+  7863/tcp: 7863
+ports_description:
+  7863/tcp: "OpenAI 兼容 API 端口（含管理 Web UI / 双平台扫码与回调登录）"
+map:
+  - config:rw
+options:
+  api_key: ""
+  region: "cn"
+  cooldown_hard_credit: "12h"
+  cooldown_soft_rate: "60s"
+  cooldown_err_threshold: 3
+  cooldown_err_cooldown: "10m"
+  checkin_times: "09:00,21:00"
+  keepalive_hours: "22"
+  upstream_timeout: 120
+schema:
+  api_key: "password"
+  region: "list(cn|global)"
+  cooldown_hard_credit: "str"
+  cooldown_soft_rate: "str"
+  cooldown_err_threshold: "int"
+  cooldown_err_cooldown: "str"
+  checkin_times: "str"
+  keepalive_hours: "str"
+  upstream_timeout: "int"
