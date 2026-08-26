@@ -1,7 +1,0 @@
-v1.0.0: AI Proxy HA add-on (WorkBuddy + TraeWork + Qoder)
-
-- Multi-account OpenAI-compatible proxy with prefix routing
-- TraeWork container login: public callback + refreshToken fallback
-- Upstream wild-work sync mechanism (SYNC.md + sync_vendor.sh + Makefile)
-- Sticky routing, auto-checkin, multi-account rotation
-- Aligned to upstream commit ad32896

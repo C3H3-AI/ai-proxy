@@ -21,3 +21,5 @@ Thumbs.db
 # Build artifacts (HA addon build produces these outside repo)
 build/
 dist/
+# temp commit messages
+.commitmsg
