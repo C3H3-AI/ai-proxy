@@ -10,11 +10,18 @@ addon 采用「复制 + 生成式 sync + 适配层隔离」策略，而非 Go mo
 |---|---|
 | 上游仓库 | https://github.com/rockswang/wild-work |
 | 本地克隆 | `D:/ai-hub/_upstream-wild-work` |
-| **对齐 commit** | `ad32896` （"粘性路由：提升会话缓存利用率"） |
-| 对齐日期 | 2026-08-25 |
+| **对齐 commit** | `c62d0bc` （TraeWork 积分明细按 group_name 分组） |
+| 对齐日期 | 2026-08-30（本次同步 4 个包：traework/upstream/qoder/provider） |
 
 > 上游 Trae 登录相关文件（`login_trae/*`、`traework/*`）自 `13e7b64` "wild-work v2" 后**未再改动**。
 > 最近活跃区是 `pool` / `server` / `qoder`（性能与透传优化），以及 CI / 文档 / `--no-tray`。
+
+
+> ⚠️ **上游 `c62d0bc` 自身编译失败**：该提交在重构 `traework.UserResourceDetail` 时
+> 误删了 `UserEntUsage` 里的 `var resp struct {`，导致上游仓库 `go build` 直接报
+> `internal/traework/client.go:469:28: syntax error`。
+> 本 addon 同步时已补回该行（见 `internal/traework/client.go`）。若后续上游修复，
+> 重新 sync 时请确认这一行仍存在。
 
 ## 包归属表（谁负责 sync，谁改了要重编）
 

@@ -60,4 +60,4 @@ GOPROXY=https://goproxy.cn,direct GOSUMDB=off go build ./... && go vet ./...
 
 ## 版本
 
-当前 `v1.0.0`。详见 `CHANGELOG.md`。
+当前 `v1.0.1`。详见 `CHANGELOG.md`。

@@ -1,5 +1,5 @@
 name: "AI Proxy"
-version: "0.1.0"
+version: "1.0.1"
 slug: "ai-proxy"
 description: "多平台 AI 账号（WorkBuddy/CodeBuddy + TraeWork）聚合为 OpenAI 兼容 API，模型带来源前缀自动路由；自动签到、多账号轮转。"
 url: "https://github.com/rockswang/workbuddy-wild"
