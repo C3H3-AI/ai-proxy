@@ -95,22 +95,47 @@ internal/traework/client.go:469:28: syntax error: unexpected ], expected operand
 ```
 已在 addon 侧补回该行。升级上游前务必确认这一行存在。
 
-### 方案 3：TraeWork 登录（根因 = 镜像旧，不是代码错）
-在**运行中的容器**里实测：
+### 方案 3：TraeWork 登录（结论已更正 — 2026-08-30 实测）
 
-| 二进制 | `auth_callback_url` | `redirect` |
-|--------|--------------------|-----------|
-| 容器内旧（8/27 构建） | `127.0.0.1:64606/authorize` ❌ 忽略 `-callback` | `1` |
-| 用当前源码重编 | `http://api.homediy.top:8443/api/trae-cb` ✅ | `0` |
+> ⚠️ **更正**：本节初稿曾断言"根因 = 镜像旧（旧二进制输出 127.0.0.1 回调）"。
+> 该结论**错误**，源于"只生成了 URL 就当作验证通过"，未走完登录流程。
+> 以下为用**真实 refreshToken + 真实上游 Windows 版**实测后的结论。
 
-结论：
-1. **代码是对的**——当前源码编译出的 `logintrae` 正确生成公网回调
-2. **跑的是旧二进制**——容器里 8/27 的镜像还在用上游 `Start()` 的 127.0.0.1 回调
-3. **必须重建镜像**才能生效（与 ha-dsh-addon 的教训一致，见其 `docs/DEBUGGING.md` §1）
+#### 实测 1：refreshToken 直登（旧 vs 新二进制，同一真实 token）
 
-另外 `logintrae complete -refresh <无效token>` 实测能连通上游并返回明确错误
-（`refresh token is invalid`），证明 **refreshToken 直登链路是通的**，
-只要持有有效 refreshToken 就能登录——这是最稳的登录方式。
+| 二进制 | 结果 |
+|--------|------|
+| 容器内旧（8/27） | ✅ `refresh success`，拿到 access_token，uid=2763545646208820 |
+| 当前源码新编译 | ✅ 同样成功 |
+
+**两者都成功** → `CompleteRefresh` 一直是通的，"镜像旧"**不是**登录失败的原因。
+
+#### 实测 2：上游 Windows 版（Downloads/wild-work-windows-amd64.exe）
+
+`data/app.log` 与 `data/state-traework.json` 证明上游**完全正常**：
+```
+11:15:51 traework 登录流程已发起
+11:16:10 traework authcode exchange success host=https://api.trae.cn
+11:16:10 traework 登录成功 uid=2763545646208820
+state: credits=201 / 800, last_checkin_at=2026-08-30T16:03（今天，仍在签到）
+```
+上游走的是 **`authcode` + PKCE 交换，回调落在 127.0.0.1**（桌面有浏览器）。
+
+#### 因此：addon 登录问题的正确定位
+
+| 路径 | 状态 | 说明 |
+|------|------|------|
+| **refreshToken 直登** | ✅ **可用（实证）** | 容器无浏览器，这本来就是最稳路径；旧二进制也能用 |
+| 公网回调 + authcode 交换 | ⚠️ **未验证** | addon 把回调改成公网后，authcode 能否成功交换**尚未实测** |
+
+**"TraeWork 登录无法实现" 的真实原因大概率在公网回调路径**，而不是：
+- ❌ 不是"镜像旧"（已证伪）
+- ❌ 不是"缺 token"（我更早的误判，已证伪）
+
+#### 教训（写给以后）
+- 生成了正确的授权 URL **不等于** 登录能用——必须走完流程（拿到 token + 写入账号）
+- 用假 token 测出"invalid token"只证明**能连上游**，不证明**登录可用**
+- 归因前先做**端到端实测**，不要靠"新旧对比 + 推测"下结论
 
 ### 顺带修复（addon 独有好改动）
 - `addon_extras.go`：公网回调去掉 `/authorize` 后缀（面板端点就是 `/api/trae-cb`，

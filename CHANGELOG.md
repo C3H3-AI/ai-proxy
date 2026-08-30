@@ -10,9 +10,12 @@
   - `provider.Upstream` 接口升至 10 方法（新增上述两项）
   - 此前是**静默降级**：接口仍是旧版 8 方法，Client 不实现也不报错，
     表现为"积分功能不可用"但无错误信息
-- **TraeWork 登录回调修正**：去掉公网回调的 `/authorize` 后缀（面板端点就是
-  `/api/trae-cb`，加后缀会 404），`redirect` 改 `0`；面板登录后自动轮询完成，
-  无需手动复制回调链接
+- **TraeWork 登录（部分修正，仍有未验证项）**：去掉公网回调的 `/authorize` 后缀
+  （面板端点就是 `/api/trae-cb`，加后缀会 404），`redirect` 改 `0`；面板登录后
+  自动轮询完成，无需手动复制回调链接
+  - 实测确认 **refreshToken 直登可用**（旧/新二进制用同一真实 token 均成功）
+  - 公网回调 + authcode 交换路径**尚未端到端验证**，若授权链接登录失败应优先用
+    refreshToken 直登
 
 ### 工程
 - 精准同步上游 4 个包（`traework`/`upstream`/`qoder`/`provider`），
