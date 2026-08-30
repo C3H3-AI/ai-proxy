@@ -75,7 +75,50 @@ addon 当前对齐上游 **`ad32896`**，上游 HEAD 已到 **`c62d0bc`**（领�
 4. **编译验证**：`go build ./... && go vet ./internal/...`
 5. **回归**：面板积分明细、模型倍率、TraeWork refreshToken 直登
 
-## 风险与注意事项
+## 本次处理（2026-08-30 实测）
+
+### 方案 2：精准同步（已完成）
+同步 `traework`/`upstream`/`qoder`/`provider` 四个包至 `c62d0bc`（18 个文件），
+`pool`/`server`/`scheduler` **刻意不同步**以缩小变更面。
+
+验证：
+- 四个包的函数集合已与上游完全一致（无缺失）
+- `provider.Upstream` 已是 10 方法接口
+- `go build ./...` / `go vet ./internal/...` 均通过
+- linux/arm64 + amd64 五个二进制交叉编译通过
+
+### 上游 `c62d0bc` 是损坏提交（重要）
+上游在重构 `traework.UserResourceDetail` 时**误删了 `UserEntUsage` 里的
+`var resp struct {`**，导致上游仓库自身无法编译：
+```
+internal/traework/client.go:469:28: syntax error: unexpected ], expected operand
+```
+已在 addon 侧补回该行。升级上游前务必确认这一行存在。
+
+### 方案 3：TraeWork 登录（根因 = 镜像旧，不是代码错）
+在**运行中的容器**里实测：
+
+| 二进制 | `auth_callback_url` | `redirect` |
+|--------|--------------------|-----------|
+| 容器内旧（8/27 构建） | `127.0.0.1:64606/authorize` ❌ 忽略 `-callback` | `1` |
+| 用当前源码重编 | `http://api.homediy.top:8443/api/trae-cb` ✅ | `0` |
+
+结论：
+1. **代码是对的**——当前源码编译出的 `logintrae` 正确生成公网回调
+2. **跑的是旧二进制**——容器里 8/27 的镜像还在用上游 `Start()` 的 127.0.0.1 回调
+3. **必须重建镜像**才能生效（与 ha-dsh-addon 的教训一致，见其 `docs/DEBUGGING.md` §1）
+
+另外 `logintrae complete -refresh <无效token>` 实测能连通上游并返回明确错误
+（`refresh token is invalid`），证明 **refreshToken 直登链路是通的**，
+只要持有有效 refreshToken 就能登录——这是最稳的登录方式。
+
+### 顺带修复（addon 独有好改动）
+- `addon_extras.go`：公网回调去掉 `/authorize` 后缀（面板端点就是 `/api/trae-cb`，
+  加后缀会 404）；`redirect` 改 `0`（与已验证的桌面版/trae2api-web 一致）
+- `login_ui.py`：打开授权链接后**自动轮询** `trae-poll`，回调到达即自动完成登录，
+  无需手动复制回调链接；手动粘贴与 refreshToken 仍保留为兜底
+
+## 风险与注意事项（遗留）
 
 - **`sync_vendor.sh` 的 PROTECT_FILES 匹配可疑**：
   `case "${dst}" in *"${PROTECT_FILES// /\n}"* )` 把换行塞进 case 模式，
