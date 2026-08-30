@@ -1044,16 +1044,36 @@ async function pollWbDone(){const btn=document.getElementById('wbDoneBtn');if(!b
 let wbTimer=null,wbStop=0;
 async function autoPollWb(){if(wbStop)return;const d=await api('wb-poll',{method:'POST'});if(d.success){wbStop=1;clearInterval(wbTimer);show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);return;}
 const em=(d.error||'').toLowerCase();if(em.includes('未完成')||em.includes('waiting')||em.includes('login ing'))return;wbStop=1;clearInterval(wbTimer);show(d.error||'登录失败');toast(d.error||'登录失败','err');}
-async function traeLogin(){show('正在启动 TraeWork 登录…');const d=await api('trae-url');if(d.error){toast(d.error,'err');return;}showBoxLink(d.url,'<b>TraeWork 登录</b>：请在浏览器打开以下链接完成登录（支持手机号/账号/抖音扫码）。<br>登录完成后：<br>1️⃣ 多数情况下授权页会自动回调本面板，直接点「完成 TraeWork 登录」即可；<br>2️⃣ 若自动回调未触发，把登录后<b>地址栏</b>里以 <code>'+esc(location.origin)+'/api/trae-cb?</code> 开头的完整链接复制，粘贴到下方「回调链接」框提交；<br>3️⃣ 最稳方式：用已登录的 Trae 客户端/浏览器取出 <b>refreshToken</b>，粘贴到下方「refreshToken」框提交（长期有效，不依赖回调）。<br><a href="'+esc(d.url)+'" target="_blank">浏览器中打开授权链接</a>');addTraeManual();addBtn('完成 TraeWork 登录（优先）',pollTrae);}
+let _traePollTimer=null;
+function traeStopAutoPoll(){if(_traePollTimer){clearTimeout(_traePollTimer);_traePollTimer=null;}}
+async function traeLogin(){
+  show('正在启动 TraeWork 登录…');
+  const d=await api('trae-url');
+  if(d.error){toast(d.error,'err');return;}
+  // 打开授权链接，并自动轮询回调是否已落盘；用户只需在 Trae 页登录，回来即完成。
+  showBoxLink(d.url,'<b>TraeWork 登录</b>：点击下方链接在浏览器完成登录（支持手机号/账号/抖音扫码）。<br>'
+    +'登录成功后授权页会<b>自动跳回本面板</b>，本弹窗会<b>自动检测并完成</b>，无需任何手动复制。<br>'
+    +'（少数情况下若未自动跳回，可把地址栏中以 <code>'+esc(location.origin)+'/api/trae-cb?</code> 开头的链接粘贴到下方「回调链接」框；refreshToken 框为可选备用，一般不必填。）<br>'
+    +'<a href="'+esc(d.url)+'" target="_blank">浏览器中打开授权链接</a>');
+  addTraeManual();
+  // 自动轮询：回调到达即自动完成
+  const tryPoll=async()=>{
+    if(!_traePollTimer) return; // 已被取消
+    const r=await api('trae-poll',{method:'POST'});
+    if(r&&r.success){traeStopAutoPoll();show(r.message);toast(r.message,'ok');setTimeout(loadAccounts,1500);return;}
+    _traePollTimer=setTimeout(tryPoll,2000);
+  };
+  traeStopAutoPoll();_traePollTimer=setTimeout(tryPoll,2000);
+}
 async function addTraeManual(){const box=document.getElementById('loginShow');box.innerHTML+='<div style="margin-top:10px;text-align:left">'
 +'<input id="traeCbUrl" placeholder="粘贴回调链接（'+esc(location.origin)+'/api/trae-cb?...）" style="width:100%;box-sizing:border-box;padding:8px;border-radius:6px;border:1px solid #2a2f3a;background:#0c0e12;color:#e6e9ef;font-size:12px"/>'
-+'<button class="btn btn-ok" id="traeCbSubmit" style="margin-top:8px;width:100%">提交回调链接</button>'
-+'<input id="traeRt" placeholder="或粘贴 refreshToken（最稳，不依赖回调）" style="width:100%;box-sizing:border-box;padding:8px;margin-top:8px;border-radius:6px;border:1px solid #2a2f3a;background:#0c0e12;color:#e6e9ef;font-size:12px"/>'
-+'<button class="btn btn-warn" id="traeRtSubmit" style="margin-top:8px;width:100%">用 refreshToken 登录</button>'
++'<button class="btn btn-ok" id="traeCbSubmit" style="margin-top:8px;width:100%">提交回调链接（自动失败时的备用）</button>'
++'<input id="traeRt" placeholder="可选：refreshToken（一般不必填，长期有效）" style="width:100%;box-sizing:border-box;padding:8px;margin-top:8px;border-radius:6px;border:1px solid #2a2f3a;background:#0c0e12;color:#e6e9ef;font-size:12px"/>'
++'<button class="btn btn-warn" id="traeRtSubmit" style="margin-top:8px;width:100%">用 refreshToken 登录（备用）</button>'
 +'</div>';document.getElementById('traeCbSubmit').onclick=submitTraeManual;document.getElementById('traeRtSubmit').onclick=submitTraeRefresh;}
-async function submitTraeManual(){const url=(document.getElementById('traeCbUrl')||{}).value||'';if(!url){toast('请先粘贴授权回调链接','err');return;}show('正在用回调链接换 token…');const d=await api('trae-complete',{method:'POST',body:{url}});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error||'换 token 失败');toast(d.error||'换 token 失败','err');}}
-async function submitTraeRefresh(){const rt=(document.getElementById('traeRt')||{}).value||'';if(!rt){toast('请先粘贴 refreshToken','err');return;}show('正在用 refreshToken 换 token…');const d=await api('trae-complete-refresh',{method:'POST',body:{refresh_token:rt}});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error||'refreshToken 登录失败');toast(d.error||'refreshToken 登录失败','err');}}
-async function pollTrae(){show('正在确认 TraeWork 登录…');const d=await api('trae-poll',{method:'POST'});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error||'TraeWork 登录尚未完成（可尝试上方手动粘贴回调链接）');toast(d.error||'TraeWork 登录尚未完成','err');}}
+async function submitTraeManual(){const url=(document.getElementById('traeCbUrl')||{}).value||'';if(!url){toast('请先粘贴授权回调链接','err');return;}traeStopAutoPoll();show('正在用回调链接换 token…');const d=await api('trae-complete',{method:'POST',body:{url}});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error||'换 token 失败');toast(d.error||'换 token 失败','err');}}
+async function submitTraeRefresh(){const rt=(document.getElementById('traeRt')||{}).value||'';if(!rt){toast('请先粘贴 refreshToken','err');return;}traeStopAutoPoll();show('正在用 refreshToken 换 token…');const d=await api('trae-complete-refresh',{method:'POST',body:{refresh_token:rt}});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error||'refreshToken 登录失败');toast(d.error||'refreshToken 登录失败','err');}}
+async function pollTrae(){traeStopAutoPoll();show('正在确认 TraeWork 登录…');const d=await api('trae-poll',{method:'POST'});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error||'TraeWork 登录尚未完成（可尝试上方手动粘贴回调链接）');toast(d.error||'TraeWork 登录尚未完成','err');}}
 let qoderDoneOpts=null;
 async function qoderLogin(){show('正在获取 Qoder 授权链接…');const d=await api('qoder-url');if(d.error){toast(d.error,'err');return;}
 showBoxLink(d.url,'<b>Qoder 登录</b>：请在浏览器打开下方链接完成登录（支持账号/扫码/手机号）。登录完成后回到本页点击下方按钮。<br><a href="'+esc(d.url)+'" target="_blank">浏览器中打开授权链接</a>');addBtn('完成 Qoder 登录',pollQoder);}

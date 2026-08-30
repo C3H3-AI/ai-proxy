@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 package upstream
@@ -394,6 +396,70 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 	return remain, nil
 }
 
+// UserResourceDetail 查询账号积分明细（所有套餐条目）。
+func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
+	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
+	now := time.Now()
+	body := map[string]any{
+		"PageNumber":               1,
+		"PageSize":                 100,
+		"ProductCode":              "p_tcaca",
+		"Status":                   []int{0, 3},
+		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
+		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
+	}
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return 0, nil, err
+	}
+	BillingHeaders(req, a)
+	data, err := c.doJSONBilling(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	var resp struct {
+		Response struct {
+			Data struct {
+				Accounts []struct {
+					PackageName         string `json:"PackageName"`
+					CapacitySize        int64  `json:"CapacitySize"`
+					CapacityRemain      int64  `json:"CapacityRemain"`
+					CapacityUsed        int64  `json:"CapacityUsed"`
+					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+				} `json:"Accounts"`
+			} `json:"Data"`
+		} `json:"Response"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, nil, fmt.Errorf("resource parse: %w", err)
+	}
+	var total int64
+	items := make([]provider.ResourceItem, 0, len(resp.Response.Data.Accounts))
+	for _, acct := range resp.Response.Data.Accounts {
+		var total_, used, remain int64
+		switch {
+		case acct.CycleCapacitySize > 0:
+			total_, used, remain = acct.CycleCapacitySize, acct.CycleCapacityUsed, acct.CycleCapacityRemain
+		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
+			total_, used, remain = acct.CycleCapacityRemain+acct.CycleCapacityUsed, acct.CycleCapacityUsed, acct.CycleCapacityRemain
+		default:
+			total_, used, remain = acct.CapacitySize, acct.CapacityUsed, acct.CapacityRemain
+		}
+		if remain < 0 { remain = 0 }
+		total += remain
+		items = append(items, provider.ResourceItem{
+			Name:   acct.PackageName,
+			Total:  total_,
+			Used:   used,
+			Remain: remain,
+		})
+	}
+	return total, items, nil
+}
+
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
 	log.Printf("workbuddy checkin start uid=%s", a.UID)
@@ -420,6 +486,87 @@ func (c *Client) Stream(w http.ResponseWriter, r io.Reader) error { return Strea
 
 // Aggregate 实现 provider.Upstream（WorkBuddy OpenAI SSE 聚合）。
 func (c *Client) Aggregate(r io.Reader) (map[string]any, error) { return Aggregate(r) }
+
+// FetchModelPricing 从 /console/enterprises/personal/models 拉取模型积分倍率。
+// 返回全量模型定价（含 credits 字段），不受 cli agent 过滤限制。
+func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error) {
+	url := c.chatBase(a) + "/console/enterprises/personal/models"
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	origin := originRefererFor(a)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("X-User-Id", a.UID)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("pricing api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	var env struct {
+		Code int `json:"code"`
+		Data struct {
+			Models []struct {
+				ID      string `json:"id"`
+				Name    string `json:"name"`
+				Credits string `json:"credits"` // "x0.79 credits"
+				Tags    []string `json:"tags"`
+			} `json:"models"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("pricing parse: %w", err)
+	}
+	if env.Code != 0 {
+		return nil, fmt.Errorf("pricing api code=%d", env.Code)
+	}
+	out := make([]provider.ModelPricing, 0, len(env.Data.Models))
+	for _, m := range env.Data.Models {
+		rate := parseCredits(m.Credits)
+		if rate <= 0 && m.ID != "auto" {
+			continue // hunyuan-chat 等非计费模型
+		}
+		note := ""
+		for _, tag := range m.Tags {
+			if strings.HasPrefix(tag, "badge:") {
+				note = strings.TrimPrefix(tag, "badge:")
+			}
+		}
+		out = append(out, provider.ModelPricing{
+			Model:   m.ID,
+			Channel: "workbuddy",
+			Rate:    rate,
+			Note:    note,
+		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("pricing api returned empty models")
+	}
+	return out, nil
+}
+
+// parseCredits 解析 "x0.08 credits" → 0.08。
+func parseCredits(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	// 去掉 "x" 前缀和 " credits" 后缀
+	s = strings.TrimPrefix(s, "x")
+	s = strings.TrimSuffix(s, " credits")
+	s = strings.TrimSpace(s)
+	var v float64
+	fmt.Sscanf(s, "%f", &v)
+	return v
+}
 
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)

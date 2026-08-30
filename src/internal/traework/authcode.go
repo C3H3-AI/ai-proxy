@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // authcode.go TraeWork AuthCode（PKCE 新流程）交换：登录回调返回 authCodeInfo，
 // 用配对的 code_verifier + ECDSA 设备公钥换取 Cloud-IDE-JWT。
 // 流程逆向自官方客户端（ai_agent.dll）与 ProjectEio/trae2api 的实现。

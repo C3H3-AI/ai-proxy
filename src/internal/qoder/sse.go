@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // sse.go 处理 QoderWork 嵌套 SSE：每行 data:{...,"body":"<json-string>"}，
 // body 字段需二次解析得到标准 OpenAI chunk。
 // 移植自 qoderwork2api internal/upstream/sse.go，含聚合与流式转写。
@@ -202,6 +204,7 @@ func sortInts(a []int) {
 // streamAsOpenAI 把嵌套 SSE 流边读边转写为标准 OpenAI SSE 给客户端。
 // 每个 chunk 重写 model 字段为客户端模型名；末尾补 data: [DONE]。
 func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) error {
+	sawDone := false
 	err := parseNestedSSE(r, func(chunk map[string]any) error {
 		chunk["model"] = model
 		raw, _ := json.Marshal(chunk)
@@ -216,11 +219,13 @@ func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) error 
 	if err != nil {
 		return err
 	}
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-		return err
-	}
-	if flush != nil {
-		flush()
+	if !sawDone {
+		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+			return err
+		}
+		if flush != nil {
+			flush()
+		}
 	}
 	return nil
 }

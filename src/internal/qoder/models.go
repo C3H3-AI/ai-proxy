@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // models.go 动态模型获取：COSY 签名 GET /algo/api/v2/model/list?Encode=1，
 // 拿 chat scene 的 key 列表 → provider.ModelInfo。
 // 移植自 qoderwork2api internal/upstream/models.go。
@@ -110,6 +112,31 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 	c.setModelMap(mm)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
+	}
+	return out, nil
+}
+
+// FetchModelPricing 实现 provider.Upstream：Qoder 模型带 price_factor，
+// 直接复用 FetchModels 的倍率字段。
+func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error) {
+	dyn, err := c.fetchModels(a)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]provider.ModelPricing, 0, len(dyn))
+	for _, m := range dyn {
+		name := NormalizeModelName(m.DisplayName)
+		if name == "" {
+			name = m.Key
+		}
+		out = append(out, provider.ModelPricing{
+			Model:   name,
+			Channel: "qoder",
+			Rate:    m.PriceFactor,
+		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("pricing api returned empty models")
 	}
 	return out, nil
 }

@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 package traework
 
 import (

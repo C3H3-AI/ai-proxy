@@ -44,7 +44,9 @@ func AuthURL(statePath, callbackBase string) (string, error) {
 	if err := writeState(statePath, st); err != nil {
 		return "", err
 	}
-	callback := strings.TrimRight(callbackBase, "/") + "/authorize"
+	// 注意：回调端点就是面板自身的 /api/trae-cb（见 login_ui.py _handle_trae_cb），
+	// 不要附加 /authorize 后缀——否则授权页跳回 /api/trae-cb/authorize 会 404。
+	callback := strings.TrimRight(callbackBase, "/")
 	u, _ := url.Parse(traework.ConsoleHost + "/authorization")
 	v := u.Query()
 	v.Set("login_version", "1")
@@ -53,7 +55,7 @@ func AuthURL(statePath, callbackBase string) (string, error) {
 	v.Set("plugin_version", traework.PluginVersion)
 	v.Set("auth_type", "local")
 	v.Set("client_id", traework.ClientID)
-	v.Set("redirect", "1")
+	v.Set("redirect", "0") // 与已验证可工作的 trae2api-web/桌面版一致：授权页登录后跳转回 auth_callback_url
 	v.Set("login_trace_id", newUUID())
 	v.Set("auth_callback_url", callback)
 	v.Set("machine_id", machineID)

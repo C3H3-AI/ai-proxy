@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // client.go QoderWork 上游客户端：业务 API（dt- Bearer）+
 // COSY 签名对话转发 + 错误分类，实现 provider.Upstream 接口。
 package qoder
@@ -303,6 +305,48 @@ func (c *Client) UserResource(a *auth.Auth) (int64, error) {
 		return 0, fmt.Errorf("quota parse: %w", err)
 	}
 	return int64(q.UserQuota.Remaining + q.AddOnQuota.Remaining), nil
+}
+
+// UserResourceDetail 查询积分明细：userQuota + addOnQuota 两个条目。
+func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
+	dt := a.JWT()
+	if dt == "" {
+		return 0, nil, fmt.Errorf("no dt- available")
+	}
+	resp, err := c.get(EpQuotaUsage, dt)
+	if err != nil {
+		return 0, nil, err
+	}
+	raw, err := readBody(resp)
+	if err != nil {
+		return 0, nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return 0, nil, c.classifyError(resp.StatusCode, string(raw))
+	}
+	var q struct {
+		UserQuota struct {
+			Total     float64 `json:"total"`
+			Used      float64 `json:"used"`
+			Remaining float64 `json:"remaining"`
+		} `json:"userQuota"`
+		AddOnQuota struct {
+			Total     float64 `json:"total"`
+			Used      float64 `json:"used"`
+			Remaining float64 `json:"remaining"`
+		} `json:"addOnQuota"`
+	}
+	if err := json.Unmarshal(raw, &q); err != nil {
+		return 0, nil, fmt.Errorf("quota parse: %w", err)
+	}
+	total := int64(q.UserQuota.Remaining + q.AddOnQuota.Remaining)
+	items := []provider.ResourceItem{
+		{Name: "用户套餐", Total: int64(q.UserQuota.Total), Used: int64(q.UserQuota.Used), Remain: int64(q.UserQuota.Remaining)},
+	}
+	if q.AddOnQuota.Total > 0 || q.AddOnQuota.Remaining > 0 {
+		items = append(items, provider.ResourceItem{Name: "赠送额度", Total: int64(q.AddOnQuota.Total), Used: int64(q.AddOnQuota.Used), Remain: int64(q.AddOnQuota.Remaining)})
+	}
+	return total, items, nil
 }
 
 // DailyCheckin Qoder 当前无签到活动：直接返回已签到语义错误，避免调用上游。

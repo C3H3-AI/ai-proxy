@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // encoding.go 实现 QoderEncoding：base64 + 自定义字母表 + 三段重排。
 // 移植自 qoderwork2api internal/upstream/encoding.go。
 package qoder

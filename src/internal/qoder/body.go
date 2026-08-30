@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // body.go 构造 agent_chat_generation 请求体（纯透传模式）。
 // 移植自 qoderwork2api internal/upstream/body.go：客户端消息全量转发，
 // tools 仅在客户端显式传入时注入。

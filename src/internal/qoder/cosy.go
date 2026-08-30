@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // cosy.go 实现 Qoder 的 COSY 请求签名：RSA 包裹 AES 会话密钥 +
 // AES-128-CBC 加密身份 + MD5 请求签名。移植自 qoderwork2api internal/upstream/cosy.go。
 package qoder

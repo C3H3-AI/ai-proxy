@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 package traework
 
 import (
@@ -217,6 +219,108 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 	return out, nil
 }
 
+// FetchModelPricing 从 /api/remote/v1/models 拉取模型积分倍率。
+// 按 config_name 去重，解析 features.consumption_rate.rate。
+func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error) {
+	url := WorkHost + EpModelsPricing + "?functions=solo_agent_remote,solo_work_remote,solo_design_remote&show_custom_model=true"
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.AccessToken)
+	req.Header.Set("X-Trae-Client-Type", "web")
+	req.Header.Set("X-Trae-User-Timezone", "Asia/Shanghai")
+	req.Header.Set("X-Preferenced-Language", "zh-cn")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Referer", "https://work.trae.cn/")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("trae pricing api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	var env struct {
+		Code int `json:"code"`
+		Data struct {
+			List []struct {
+				Function string `json:"function"`
+				Models   []struct {
+					Name        string `json:"name"`
+					DisplayName string `json:"display_name"`
+					Features    string `json:"features"` // JSON 字符串
+				} `json:"models"`
+			} `json:"list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("trae pricing parse: %w", err)
+	}
+	if env.Code != 0 {
+		return nil, fmt.Errorf("trae pricing api code=%d", env.Code)
+	}
+	// 按 name 去重：同一模型可能出现在多个 function 下，倍率一致
+	seen := map[string]bool{}
+	out := make([]provider.ModelPricing, 0)
+	for _, fn := range env.Data.List {
+		for _, m := range fn.Models {
+			if seen[m.Name] {
+				continue
+			}
+			seen[m.Name] = true
+			rate := parseTraeFeatures(m.Features)
+			if rate <= 0 {
+				continue
+			}
+			out = append(out, provider.ModelPricing{
+				Model:   m.Name,
+				Channel: "traework",
+				Rate:    rate,
+			})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("trae pricing api returned empty")
+	}
+	return out, nil
+}
+
+// parseTraeFeatures 解析 features JSON 字符串中的 consumption_rate.rate。
+// 若有 discount 则优先取折扣价。
+func parseTraeFeatures(features string) float64 {
+	if features == "" {
+		return 0
+	}
+	var f struct {
+		ConsumptionRate struct {
+			Enable bool `json:"enable"`
+			Data   struct {
+				Rate float64 `json:"rate"`
+			} `json:"data"`
+		} `json:"consumption_rate"`
+		Discount struct {
+			Enable bool `json:"enable"`
+			Data   struct {
+				ConsumptionRate float64 `json:"consumption_rate"`
+			} `json:"data"`
+		} `json:"discount"`
+	}
+	if err := json.Unmarshal([]byte(features), &f); err != nil {
+		return 0
+	}
+	// 折扣价优先
+	if f.Discount.Enable && f.Discount.Data.ConsumptionRate > 0 {
+		return f.Discount.Data.ConsumptionRate
+	}
+	if f.ConsumptionRate.Enable && f.ConsumptionRate.Data.Rate > 0 {
+		return f.ConsumptionRate.Data.Rate
+	}
+	return 0
+}
+
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -384,6 +488,69 @@ func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 		remainF += p.EntitlementBaseInfo.Quota.CreditsLimit - p.Usage.CreditsAmount
 	}
 	return int64(remainF), nil
+}
+
+// UserResourceDetail 查询 TraeWork 积分明细（每个套餐条目）。
+func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceItem, error) {
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true}`)))
+	if err != nil {
+		return 0, nil, err
+	}
+	UgHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	var resp struct {
+		UserEntitlementPackList []struct {
+			EntitlementBaseInfo struct {
+				Quota struct {
+					CreditsLimit float64 `json:"credits_limit"`
+				}
+				PackageName   string `json:"package_name"`
+				PackageType   string `json:"package_type"`
+			} `json:"entitlement_base_info"`
+			DisplayDesc   string `json:"display_desc"`
+			GroupName     string `json:"group_name"`
+			GroupType     int    `json:"group_type"`
+			Usage struct {
+				CreditsAmount float64 `json:"credits_amount"`
+			} `json:"usage"`
+		} `json:"user_entitlement_pack_list"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, nil, fmt.Errorf("ent usage parse: %w", err)
+	}
+	var total int64
+	items := make([]provider.ResourceItem, 0, len(resp.UserEntitlementPackList))
+	for _, p := range resp.UserEntitlementPackList {
+		limit := int64(p.EntitlementBaseInfo.Quota.CreditsLimit)
+		used := int64(p.Usage.CreditsAmount)
+		remain := limit - used
+		if remain < 0 { remain = 0 }
+		total += remain
+		// 优先使用 group_name（如"每日签到"、"每月登录积分"），其次 display_desc，最后兜底
+		name := p.GroupName
+		if name == "" {
+			name = p.DisplayDesc
+		}
+		if name == "" {
+			name = p.EntitlementBaseInfo.PackageName
+		}
+		if name == "" {
+			name = p.EntitlementBaseInfo.PackageType
+		}
+		if name == "" {
+			name = fmt.Sprintf("套餐 (group_type=%d)", p.GroupType)
+		}
+		items = append(items, provider.ResourceItem{
+			Name:   name,
+			Total:  limit,
+			Used:   used,
+			Remain: remain,
+		})
+	}
+	return total, items, nil
 }
 
 func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, err error) {

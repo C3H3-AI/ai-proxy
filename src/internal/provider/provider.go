@@ -1,3 +1,5 @@
+// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
+
 // Package provider 定义不同上游（workbuddy / traework）共用的最小接口。
 // 只抽取 server/scheduler 必需能力，避免为未来平台过度设计。
 package provider
@@ -72,14 +74,32 @@ type ModelInfo struct {
 	MaxTokens     int64
 }
 
+// ModelPricing 模型积分定价（从上游 API 拉取）。
+type ModelPricing struct {
+	Model   string  `json:"model"`
+	Channel string  `json:"channel"`
+	Rate    float64 `json:"rate"`
+	Note    string  `json:"note,omitempty"` // 折扣/标签说明
+}
+
 // Upstream 是 server/scheduler 依赖的最小上游能力集合。
 type Upstream interface {
 	RefreshToken(a *auth.Auth) error
 	ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error)
 	FetchModels(a *auth.Auth) ([]ModelInfo, error)
+	FetchModelPricing(a *auth.Auth) ([]ModelPricing, error)
 	UserResource(a *auth.Auth) (int64, error)
+	UserResourceDetail(a *auth.Auth) (int64, []ResourceItem, error)
 	DailyCheckin(a *auth.Auth) error
 	Classify(status int, body string) ErrKind
 	Stream(w http.ResponseWriter, r io.Reader) error
 	Aggregate(r io.Reader) (map[string]any, error)
+}
+
+// ResourceItem 积分明细条目。
+type ResourceItem struct {
+	Name   string `json:"name"`
+	Total  int64  `json:"total"`
+	Used   int64  `json:"used"`
+	Remain int64  `json:"remain"`
 }
