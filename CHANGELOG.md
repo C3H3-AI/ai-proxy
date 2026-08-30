@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.0.5 (2026-08-30)
+
+### 新增
+- **WorkBuddy 流量统计「客户端」识别**：`ChatHeaders` 补发官方桌面端同款的客户端身份头
+  `X-IDE-Type`/`X-IDE-Name`（= `WorkBuddy`）、`X-IDE-Version`、`X-Product-Version`，
+  使上游用量统计界面把本代理发起的请求识别为 **workbuddy**（此前为空）。
+  - 根因：WorkBuddy 用量统计的「客户端」列读取 `X-IDE-Type`/`X-IDE-Name`，
+    上游 wild-work 从未发送这些头，故显示为空；官方桌面端默认 ideType/ideName = "WorkBuddy"。
+  - 依据：直接解包官方 WorkBuddy 桌面端 `app.asar` + `app.asar.unpacked/cli/dist/codebuddy.js`，
+    确认桌面端与 CLI 的头契约（桌面 `WorkBuddy`，CLI `CLI`）。
+  - `internal/upstream/headers.go` 已加入 `sync_vendor.sh` 的 `PROTECT_FILES`，
+    该文件转为 addon 独有维护，`sync_vendor.sh` 不再覆盖。
+- 版本升至 `1.0.5`（`config.yaml` / `build.yaml`），高于 HA 当前运行的 `1.0.4`，供 Supervisor 升级。
+
 ## v1.0.1 (2026-08-30)
 
 ### 修复

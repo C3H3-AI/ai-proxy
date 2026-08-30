@@ -1,7 +1,8 @@
-// CODE GENERATED FROM wild-work@c62d0bc -- DO NOT EDIT, run sync_vendor.sh
-
 // Package headers 构造三类上游请求头（common / chat / billing / refresh）。
 // 规则来自 docs/api-reference.md §0/§4/§6。
+// 注意: 本文件已加入 sync_vendor.sh 的 PROTECT_FILES（addon 独有维护）。
+// 在 wild-work 的 clientUA/X-Product 基础上, addon 额外携带 X-IDE-*/X-Product-Version
+// 客户端身份头, 使 WorkBuddy 流量统计「客户端」列显示为 workbuddy（与官方桌面端一致）。
 package upstream
 
 import (
@@ -14,6 +15,14 @@ const (
 	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
+
+	// addon 客户端身份头（WorkBuddy 官方桌面端对等值）。
+	// 官方桌面端 main/server.go 默认 ideType/ideName = "WorkBuddy"；
+	// 缺失这些头时 WorkBuddy 流量统计「客户端」列显示为空。
+	clientIDEType    = "WorkBuddy"
+	clientIDEName    = "WorkBuddy"
+	clientIDEVersion = "5.4.4"
+	clientProdVer    = "5.4.4"
 )
 
 func originRefererFor(a *auth.Auth) string {
@@ -60,6 +69,11 @@ func ChatHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	req.Header.Set("X-Product", "SaaS")
+	// addon: 客户端身份头 —— WorkBuddy 流量统计「客户端」列依赖它们。
+	req.Header.Set("X-IDE-Type", clientIDEType)
+	req.Header.Set("X-IDE-Name", clientIDEName)
+	req.Header.Set("X-IDE-Version", clientIDEVersion)
+	req.Header.Set("X-Product-Version", clientProdVer)
 }
 
 // BillingHeaders billing 接口请求头。

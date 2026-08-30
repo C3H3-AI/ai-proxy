@@ -151,3 +151,54 @@ state: credits=201 / 800, last_checkin_at=2026-08-30T16:03（今天，仍在签�
   同步后必须校验这两个文件仍存在且内容未变。
 - 上游 `abb5875` 改的是桌面前端 `app.js`；addon 面板是 `login_ui.py`（Python），
   若面板有"批量刷新/批量签到"入口，需**另外对照实现** POST 传 body。
+## WorkBuddy 流量统计「客户端」显示为空（2026-08-30 实证）
+
+> 目标：让 ha-ai-proxy 发起的请求在 WorkBuddy 用量统计界面被识别为 **workbuddy**，而非空白。
+> 方法：直接解包本机官方 WorkBuddy 桌面端 `app.asar` + `app.asar.unpacked/cli/dist/codebuddy.js`，
+>      反推"客户端"列所依赖的请求头。
+>
+> 结论：**无需抓包**——官方客户端源码已给出确定性答案。
+
+### 根因
+
+WorkBuddy 用量统计的「客户端」列读取请求头 `X-IDE-Type` / `X-IDE-Name`
+（次要：`X-IDE-Version`、`X-Product-Version`）。
+官方客户端每次 chat 请求都携带这些头，而上游 `wild-work` 的 `ChatHeaders`
+只发 `User-Agent: CLI/2.63.2 CodeBuddy/2.63.2` + `X-Product: SaaS`，**从不发送 `X-IDE-*`**，
+故统计界面显示为空。
+
+### 官方客户端头契约（源码实证）
+
+| 头 | 官方桌面端 (WorkBuddy) | 官方 CLI (codebuddy.js) | addon 改动后 |
+|----|------------------------|------------------------|--------------|
+| `X-IDE-Type` | `WorkBuddy` | `CLI` | `WorkBuddy` |
+| `X-IDE-Name` | `WorkBuddy` | `CLI` | `WorkBuddy` |
+| `X-IDE-Version` | app 版本 | cli 版本 | `5.4.4` |
+| `X-Product-Version` | app 版本 | cli 版本 | `5.4.4` |
+| `X-Product` | `SaaS` | `SaaS` | `SaaS`（不变） |
+| `X-User-Id` | uid | uid | uid（不变） |
+| User-Agent | `WorkBuddy/<ver>` | `CLI/2.63.2 CodeBuddy/2.63.2` | 不变 |
+
+证据位置：
+- 桌面端 `main/server.js`：`DEFAULT_IDE_INFO = { ideType: "WorkBuddy", ideName: "WorkBuddy" }`
+- 桌面端 `main/client-info-env.js`：`WORKBUDDY_PLATFORM = "WorkBuddy"`、`CLIENT_INFO_IDE_TYPE`
+- CLI `cli/dist/codebuddy.js`：`PRODUCT_TYPE = "CLI"`、`PRODUCT_LOWERCASE_NAME = "codebuddy"`，
+  chat 请求头构建处设置 `X-IDE-Type/Name/Version`、`X-Product`、`X-Product-Version` 等
+- 安装版本：`@genie/workbuddy-desktop` `5.4.4`（productName=WorkBuddy）
+
+### 改动
+
+1. `internal/upstream/headers.go` 加入 `sync_vendor.sh` 的 `PROTECT_FILES`（addon 独有维护）。
+2. `ChatHeaders` 补发 `X-IDE-Type`/`X-IDE-Name`=`WorkBuddy`、`X-IDE-Version`、`X-Product-Version`。
+3. 版本升至 `1.0.5`（高于 HA 运行中的 `1.0.4`，供 Supervisor 升级）。
+
+### 验证方式（端到端）
+
+部署 v1.0.5 后，用同一账号在 WorkBuddy 用量统计页发起一次 chat，
+观察「客户端」列从「空」变为「workbuddy」。
+
+### 遗留
+
+- 若期望显示「CLI」而非「workbuddy」，把 `X-IDE-Type/Name` 改为 `CLI` 即可（与官方 CLI 一致）。
+- 版本号 `5.4.4` 取自本机安装的官方桌面端；若官方升级，可同步调整常量。
+- `headers.go` 已成为 addon 独有文件，未来上游若改动该文件，addon 不会自动跟随，需人工合并。

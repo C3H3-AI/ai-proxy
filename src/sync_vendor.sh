@@ -33,6 +33,7 @@ SYNC_PKGS="auth config login login_qoder login_trae pool provider qoder schedule
 PROTECT_FILES=(
   "internal/login_trae/addon_extras.go"
   "internal/svc/svc.go"
+  "internal/upstream/headers.go"
 )
 
 echo "==> upstream HEAD: ${COMMIT}"
