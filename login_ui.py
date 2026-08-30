@@ -534,6 +534,41 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": {"message": "upstream error: %s" % e, "type": "api_error", "code": "upstream_unavailable"}}, 502)
 
     # ---- handlers ----
+    def _handle_fees(self):
+        """转发费率查询到 serverd 的 /api/fees。"""
+        try:
+            req = urllib.request.Request(SRVD_UPSTREAM + "/api/fees", method="GET")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            self._send_json(data)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            self._send_json({"error": "费率接口 HTTP %d: %s" % (e.code, body), "channels": []}, 502)
+        except Exception as e:
+            self._send_json({"error": "费率接口不可用：%s" % e, "channels": []}, 502)
+
+    def _handle_fees_refresh(self):
+        """请求 serverd 重新拉取费率，并立即返回当前缓存。"""
+        try:
+            req = urllib.request.Request(SRVD_UPSTREAM + "/api/fees/refresh", method="POST",
+                                         data=b"{}", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            self._send_json(data)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            self._send_json({"error": "刷新费率 HTTP %d: %s" % (e.code, body), "channels": []}, 502)
+        except Exception as e:
+            self._send_json({"error": "刷新费率失败：%s" % e, "channels": []}, 502)
+
     def _handle_overview(self):
         self._send_json(overview_data())
 
@@ -827,6 +862,10 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._handle_trae_poll()
         elif match_key(path, "qoder-poll"):
             self._handle_qoder_poll()
+        elif match_key(path, "fees-refresh"):
+            self._handle_fees_refresh()
+        elif match_key(path, "fees"):
+            self._handle_fees()
         elif match_key(path, "credits"):
             self._handle_action("credits")
         elif match_key(path, "checkin"):
@@ -917,6 +956,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
 <button class="tab active" data-p="overview" onclick="switchPanel('overview')">概览</button>
 <button class="tab" data-p="accounts" onclick="switchPanel('accounts')">账号</button>
 <button class="tab" data-p="models" onclick="switchPanel('models')">模型</button>
+<button class="tab" data-p="fees" onclick="switchPanel('fees')">费率</button>
 <button class="tab" data-p="settings" onclick="switchPanel('settings')">设置</button>
 </nav>
 <div class="toast" id="toastBox"></div>
@@ -966,6 +1006,16 @@ tr:hover td{background:rgba(255,255,255,.02)}
  </div>
 </section>
 
+<section class="panel" id="panel-fees">
+ <div class="tbar">
+  <div class="grp"><button class="btn btn-pri" id="btnRefreshFees" onclick="refreshFees()">刷新费率</button></div>
+  <span class="hint" id="feesInfo"></span>
+ </div>
+ <div class="box" id="feesBox">
+  <p class="hint" style="margin:0">加载中…</p>
+ </div>
+</section>
+
 <section class="panel" id="panel-settings">
  <div class="box"><h2>设置</h2>
   <p class="hint" style="margin:0 0 14px">保存后写入 <code>/data/options.json</code> 并热重启 serverd 生效（不影响本面板）。</p>
@@ -994,7 +1044,62 @@ let ovTimer=null;
 function toast(msg,type){const b=document.getElementById('toastBox');const t=document.createElement('div');t.className='t '+(type||'info');t.textContent=msg;b.appendChild(t);setTimeout(()=>{t.style.opacity=0;t.style.transition='opacity .3s';setTimeout(()=>t.remove(),300);},4200);}
 async function api(key,opts){opts=opts||{};try{const r=await fetch('wb-api/'+key,{method:opts.method||'GET',headers:opts.body?{'Content-Type':'application/json'}:{},body:opts.body?JSON.stringify(opts.body):undefined});const txt=await r.text();let d;try{d=JSON.parse(txt);}catch(e){d={error:txt,status:r.status};}return d;}catch(e){return{error:'网络错误: '+e.message};}}
 function esc(s){s=(s===null||s===undefined)?'':String(s);return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='settings')loadSettings();}
+async function loadFees(){
+  const box=document.getElementById('feesBox');
+  if(!box) return;
+  const d=await api('fees');
+  renderFees(d);
+}
+
+async function refreshFees(){
+  const btn=document.getElementById('btnRefreshFees');
+  if(btn) btn.disabled=true;
+  try{
+    const d=await api('fees-refresh',{method:'POST'});
+    renderFees(d);
+    toast('费率已刷新（后台重新拉取，稍后自动更新）','ok');
+    setTimeout(loadFees,3000);
+  }catch(e){ toast((e&&e.message)||'刷新失败','err'); }
+  finally{ if(btn) btn.disabled=false; }
+}
+
+function renderFees(fees){
+  const box=document.getElementById('feesBox');
+  if(!box) return;
+  const channels=(fees&&fees.channels)||[];
+  let html='';
+  if(fees&&fees.note) html+='<p class="hint" style="margin:0 0 6px">'+esc(fees.note)+'</p>';
+  if(fees&&fees.cached_at) html+='<p class="hint" style="margin:0 0 6px">上次更新：'+esc(fees.cached_at)+'</p>';
+  if(fees&&fees.error) html+='<p class="hint" style="margin:0 0 6px;color:var(--err)">'+esc(fees.error)+'</p>';
+  if(channels.length===0){
+    html+='<p class="hint" style="margin:0">'+esc((fees&&fees.disclaimer)||'')+'</p>';
+    box.innerHTML=html; return;
+  }
+  html+='<table><thead><tr><th>模型</th><th>倍率</th><th>模型</th><th>倍率</th></tr></thead><tbody>';
+  for(const ch of channels){
+    const chName = ch.channel==='traework'?'TraeWork':(ch.channel==='qoder'?'Qoder':'WorkBuddy');
+    html+='<tr><td colspan="4" style="color:var(--sub);font-weight:600">'+esc(chName)+'</td></tr>';
+    const models=ch.models||[];
+    for(let i=0;i<models.length;i+=2){
+      const m1=models[i], m2=models[i+1];
+      html+='<tr><td><code>'+esc(m1.model)+'</code></td><td>'+fmtRate(m1)+'</td>';
+      html+='<td>'+((m2&&m2.model)?'<code>'+esc(m2.model)+'</code>':'')+'</td><td>'+((m2&&m2.model)?fmtRate(m2):'')+'</td></tr>';
+    }
+  }
+  html+='</tbody></table>';
+  if(fees&&fees.disclaimer) html+='<p class="hint" style="margin:8px 0 0">'+esc(fees.disclaimer)+'</p>';
+  box.innerHTML=html;
+}
+
+function fmtRate(m){
+  if(!m) return '';
+  const r=(m.rate===undefined||m.rate===null)?0:m.rate;
+  let s=(Number(r)||0).toString();
+  if(m.note) s+=' <span style="color:var(--sub);font-size:11px">'+esc(m.note)+'</span>';
+  return s;
+}
+
+function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='fees')loadFees();if(n==='settings')loadSettings();}
 function refreshAll(){loadOverview(true);loadAccounts();}
 function fmtT(v){if(!v)return '—';const t=new Date(v*1000);if(isNaN(t))return String(v);return t.toLocaleString('zh-CN',{hour12:false});}
 function stateBadge(a){if(a.disabled)return '<span class="badge b-bad">已禁用</span>';if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');return '<span class="badge b-ok">可用</span>';}

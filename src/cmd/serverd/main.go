@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	"context"
 	"flag"
 	"log"
@@ -64,9 +65,27 @@ func main() {
 	go r.TraeWorkScheduler.Run(ctx)
 	go r.QoderScheduler.Run(ctx)
 
+	// 费率接口：/api/fees 与 /api/fees/refresh 需要访问 svc.Runtime 的定价缓存，
+	// 而 server.Handler 只接收 server.Config（不含 Runtime），因此在 serverd 层包装一层路由。
+	fees := http.NewServeMux()
+	fees.HandleFunc("GET /api/fees", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(r.FeesInfo())
+	})
+	fees.HandleFunc("POST /api/fees/refresh", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(r.FeesInfo())
+		go func() {
+			defer func() { _ = recover() }()
+			r.RefreshPricing()
+		}()
+	})
+	// 其余请求交给原 Handler（/v1/*、/status、/healthz）
+	fees.Handle("/", h)
+
 	srv := &http.Server{
 		Addr:              cfg.Listen.Addr(),
-		Handler:           h,
+		Handler:           fees,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go func() {
