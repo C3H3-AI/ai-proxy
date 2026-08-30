@@ -13,7 +13,7 @@ chmod 700 /data/auths /data/data 2>/dev/null || true
 
 echo "[AI-Proxy] Starting management panel (login_ui.py)..."
 echo "[AI-Proxy]   Internal serverd port: 7864"
-echo "[AI-Proxy]   Public/Ingress port:    7863 (OpenAI API + 管理 Web UI)"
+echo "[AI-Proxy]   Public/Ingress port:    7870 (OpenAI API + 管理 Web UI)"
 echo "[AI-Proxy]   auth_dir: /data/auths (WorkBuddy / TraeWork 登录)"
 
 exec python3 /app/login_ui.py

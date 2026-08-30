@@ -62,8 +62,8 @@ RUN chmod a+x /run.sh /app/serverd /app/ctl /app/login /app/logintrae /app/login
 WORKDIR /app
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
-    CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
+    CMD wget -qO- http://127.0.0.1:7870/healthz || exit 1
 
-EXPOSE 7863
+EXPOSE 7870
 
 CMD [ "/run.sh" ]

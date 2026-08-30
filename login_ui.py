@@ -23,7 +23,7 @@ import urllib.request
 # 常量
 # ---------------------------------------------------------------------------
 HOST = "0.0.0.0"
-PORT = 7863
+PORT = 7870
 SRVD_PORT = 7864
 SRVD_UPSTREAM = "http://127.0.0.1:%d" % SRVD_PORT
 

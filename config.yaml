@@ -10,17 +10,17 @@ startup: "application"
 boot: "auto"
 ingress: true
 panel_icon: "mdi:server-network"
-# ingress 与管理 UI、OpenAI API 都走 7863（统一入口）
-ingress_port: 7863
+# ingress 与管理 UI、OpenAI API 都走 7870（统一入口）
+ingress_port: 7870
 panel_title: "AI Proxy 管理"
 homeassistant: "2024.1.0"
 hassio_api: true
 hassio_role: "default"
 host_network: false
 ports:
-  7863/tcp: 7863
+  7870/tcp: 7870
 ports_description:
-  7863/tcp: "OpenAI 兼容 API 端口（含管理 Web UI / 双平台扫码与回调登录）"
+  7870/tcp: "OpenAI 兼容 API 端口（含管理 Web UI / 双平台扫码与回调登录）"
 map:
   - config:rw
 options:
