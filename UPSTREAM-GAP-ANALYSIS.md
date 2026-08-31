@@ -202,3 +202,19 @@ WorkBuddy 用量统计的「客户端」列读取请求头 `X-IDE-Type` / `X-IDE
 - 若期望显示「CLI」而非「workbuddy」，把 `X-IDE-Type/Name` 改为 `CLI` 即可（与官方 CLI 一致）。
 - 版本号 `5.4.4` 取自本机安装的官方桌面端；若官方升级，可同步调整常量。
 - `headers.go` 已成为 addon 独有文件，未来上游若改动该文件，addon 不会自动跟随，需人工合并。
+### 端到端验证结果（2026-08-31 实证）
+
+> ✅ **X-IDE 客户端头修复已确认生效**。
+> 通过 7870 addon 用倪庆州账号（cdafc690）调用 `workbuddy/deepseek-v4-flash`，
+> 在 `https://www.workbuddy.cn/profile/plans-usage` 看到记录：
+>
+> | 时间 | 模型 | 客户端列 | 消息 |
+> |------|------|----------|------|
+> | 2026-08-31 10:30 | deepseek-v4-flash | **WorkBuddy** | trace test |
+> | 2026-08-31 10:23 | deepseek-v4-flash | **WorkBuddy** | test Ni Qingzhou account |
+>
+> 「客户端」列显示 **WorkBuddy**（此前为空），证明 `X-IDE-Type/Name = WorkBuddy` 头被 WorkBuddy 用量统计正确识别。
+> 请求确实到达上游（ngrep 抓到到 `copilot.tencent.com` 的 TLS 流量，上游返回成功）。
+
+> 部署：`app_9a112f41_ai-proxy`（端口 7870）跑 `9a112f41/aarch64-addon-ai-proxy:1.0.5`（healthy）。
+> 注意：WorkBuddy 账号池需重启 serverd 才能重新扫描 auth 目录（state 文件持久化）。
