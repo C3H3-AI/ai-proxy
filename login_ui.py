@@ -47,6 +47,8 @@ SRVD_LISTEN = "0.0.0.0:%d" % SRVD_PORT
 
 DEFAULT_OPTIONS = {
     "api_key": "",
+    "webui_user": "",
+    "webui_pass": "",
     "region": "cn",
     "cooldown_hard_credit": "12h",
     "cooldown_soft_rate": "60s",
@@ -59,6 +61,39 @@ DEFAULT_OPTIONS = {
 
 PROXY_PREFIX = "/v1/"
 V1_RAW = ["/v1/models", "/status", "/healthz"]
+
+WEBUI_COOKIE = "ai_proxy_session"
+SESSION_FILE = "/tmp/ai-proxy-webui-session"
+
+
+def _webui_enabled():
+    """Web UI 面板是否启用账号登录。"""
+    o = load_options()
+    return bool((o.get("webui_user") or "").strip() and (o.get("webui_pass") or "").strip())
+
+
+def _webui_check_cookie(cookie_val):
+    """校验面板会话 cookie。"""
+    if not cookie_val:
+        return False
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() == cookie_val.strip()
+    except Exception:
+        return False
+
+
+def _webui_new_session():
+    """生成并持久化一个新会话 token。"""
+    import hashlib, time
+    tok = hashlib.sha256(("%f|%d" % (time.time(), id(SESSION_FILE))).encode()).hexdigest()
+    try:
+        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+            f.write(tok)
+    except Exception:
+        pass
+    return tok
+
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +507,55 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _cookie(self):
+        ck = self.headers.get("Cookie", "") or ""
+        for part in ck.split(";"):
+            part = part.strip()
+            if part.startswith(WEBUI_COOKIE + "="):
+                return part[len(WEBUI_COOKIE)+1:].strip()
+        return ""
+
+    def _handle_login_get(self):
+        self._send(LOGIN_PAGE, "text/html; charset=utf-8")
+
+    def _handle_login_post(self):
+        body = read_body(self) or {}
+        user = (body.get("user") or "").strip()
+        pw = (body.get("pass") or "").strip()
+        o = load_options()
+        want_user = (o.get("webui_user") or "").strip()
+        want_pass = (o.get("webui_pass") or "").strip()
+        if want_user and user == want_user and pw == want_pass:
+            tok = _webui_new_session()
+            self._send_json({"ok": True, "token": tok})
+        else:
+            self._send_json({"error": "用户名或密码错误"}, 401)
+
+    def _handle_qr(self):
+        """本地二维码：后端代拉 qrserver，返回 PNG（浏览器无需直连外部）。"""
+        q = {}
+        try:
+            q.update(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+        except Exception:
+            pass
+        data = q.get("data", "")
+        if not data:
+            self._send("no data", "text/plain", 400)
+            return
+        url = "https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=" + urllib.parse.quote(data, safe="")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urllib.request.urlopen(req, timeout=15)
+            png = resp.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(png)
+        except Exception as e:
+            self._send("qr error: %s" % e, "text/plain", 502)
+
     def _send(self, data, ctype, code=200, extra=None):
         if isinstance(data, str):
             data = data.encode("utf-8")
@@ -489,6 +573,15 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     # ---- 代理 /v1/* 到 serverd（流式透传） ----
     def _proxy(self, method):
         path = self.path
+        # addon 安全：若配置了 api_key，/v1/* 必须带匹配的 Bearer
+        o = load_options()
+        want_key = (o.get("api_key") or "").strip()
+        if want_key:
+            auth = self.headers.get("Authorization", "") or ""
+            got = auth[len("Bearer "):].strip() if auth.lower().startswith("bearer ") else ""
+            if got != want_key:
+                self._send_json({"error": {"code": "invalid_api_key", "message": "missing or invalid API key", "type": "api_error"}}, 401)
+                return
         # 前端 wb-api/<key> 的管理接口在匹配到模型/状态时需重写为 serverd 的 /v1/* 路径
         if path.endswith("/wb-api/models") or path.endswith("/api/models"):
             path = "/v1/models"
@@ -815,10 +908,21 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     # ---- 路由 ----
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
-        if path == "/" or path.endswith("/"):
-            self._send(HTML_PAGE, "text/html; charset=utf-8")
-        elif path == "/healthz":
+        if path == "/healthz":
             self._send("OK", "text/plain")
+        # ---- Web UI 面板登录门禁 ----
+        if path == "/" or path.endswith("/"):
+            if _webui_enabled() and not _webui_check_cookie(self._cookie()):
+                self._send(LOGIN_PAGE, "text/html; charset=utf-8")
+                return
+            self._send(HTML_PAGE, "text/html; charset=utf-8")
+        elif match_key(path, "login"):
+            self._handle_login_get()
+        elif match_key(path, "qr"):
+            self._handle_qr()
+        elif _webui_enabled() and not _webui_check_cookie(self._cookie()) and not path.startswith(PROXY_PREFIX):
+            # 面板管理接口需登录；/v1/* API 走 api_key，不要求面板登录
+            self._send_json({"error": "未登录，请先访问面板首页登录"}, 401)
         elif match_key(path, "overview"):
             self._handle_overview()
         elif match_key(path, "accounts"):
@@ -848,7 +952,9 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if match_key(path, "config"):
+        if match_key(path, "login"):
+            self._handle_login_post()
+        elif match_key(path, "config"):
             self._handle_config_save()
         elif match_key(path, "wb-poll"):
             self._handle_wb_poll()
@@ -882,6 +988,38 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
 
 # ---------------------------------------------------------------------------
 # HTML 页面
+# ---------------------------------------------------------------------------
+LOGIN_PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Proxy 登录</title>
+<style>
+body{margin:0;background:#0f1115;color:#e6e9ef;font:14px/1.6 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#171a21;border:1px solid #2a2f3a;border-radius:12px;padding:28px;width:320px;max-width:92vw}
+h1{font-size:18px;margin:0 0 18px}
+label{display:block;margin:10px 0 4px;color:#9aa3b2;font-size:13px}
+input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #2a2f3a;background:#0c0e12;color:#e6e9ef;font-size:14px;box-sizing:border-box}
+button{margin-top:18px;width:100%;padding:11px;border:0;border-radius:8px;background:#0a84ff;color:#fff;font-size:14px;cursor:pointer}
+button:hover{background:#3395ff}
+.err{color:#ff453a;font-size:13px;margin-top:10px;min-height:16px}
+</style></head><body>
+<div class="card">
+<h1>AI Proxy 管理面板</h1>
+<form id="lf">
+<label>账号</label><input id="lu" autocomplete="username">
+<label>密码</label><input id="lp" type="password" autocomplete="current-password">
+<button type="submit">登录</button>
+</form>
+<div class="err" id="lerr"></div>
+</div>
+<script>
+document.getElementById('lf').addEventListener('submit',async function(ev){ev.preventDefault();
+var u=document.getElementById('lu').value,p=document.getElementById('lp').value,err=document.getElementById('lerr');err.textContent='';
+try{var r=await fetch('wb-api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,pass:p})});
+var d=await r.json();if(d.ok){document.cookie='ai_proxy_session='+d.token+';path=/';location.reload();}else{err.textContent=d.error||'登录失败';}}
+catch(e){err.textContent='网络错误: '+e.message;}});
+</script>
+</body></html>"""
+
 # ---------------------------------------------------------------------------
 HTML_PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1135,7 +1273,7 @@ async function acctAction(action,kind,uid){toast('正在执行…','info');const
 async function runAll(action,uid){if(!confirm('确定要对所有账号执行吗？'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{uid:''}});showBatch(d);setTimeout(loadAccounts,1300);}
 function showBatch(d){if(d.error){toast(d.error,'err');return;}const rs=d.results||[];if(!rs.length){toast(d.message||'完成','ok');return;}rs.forEach(r=>toast((r.ok?'✓ ':'✗ ')+'['+(r.kind||'')+'] '+r.uid+'：'+r.msg,r.ok?'ok':'err'));}
 async function delAcct(kind,uid){if(!confirm('确认删除该账号？'))return;const d=await api('delete',{method:'POST',body:{platform:kind,uid:uid}});toast(d.success?d.message:d.error,d.success?'ok':'err');setTimeout(loadAccounts,1500);}
-function qrURL(u){return 'https://api.qrserver.com/v1/create-qr-code/?size=240x240&data='+encodeURIComponent(u);}
+function qrURL(u){return 'wb-api/qr?data='+encodeURIComponent(u);}
 async function wbLogin(){show('正在获取 WorkBuddy 登录页…');const d=await api('wb-url');if(d.error){toast(d.error,'err');return;}
 const u=d.url||'';
 document.getElementById('loginShow').innerHTML='<div class="hint">请用<b>微信扫码</b>，或点下方「浏览器中打开」用手机号登录。若显示企业登录，请切到「个人登录」。</div>'+
