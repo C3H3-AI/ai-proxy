@@ -47,8 +47,8 @@ SRVD_LISTEN = "0.0.0.0:%d" % SRVD_PORT
 
 DEFAULT_OPTIONS = {
     "api_key": "",
-    "webui_user": "",
-    "webui_pass": "",
+    "webui_user": "admin",
+    "webui_pass": "admin",
     "region": "cn",
     "cooldown_hard_credit": "12h",
     "cooldown_soft_rate": "60s",
@@ -694,6 +694,15 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     def _handle_config_get(self):
         self._send_json({"options": load_options(), "config_file": CONFIG_FILE})
 
+    def _handle_logout(self):
+        """退出登录：作废当前会话 token 并提示浏览器清除 cookie。"""
+        try:
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
+        except Exception:
+            pass
+        self._send_json({"success": True, "message": "已退出登录", "clear_cookie": WEBUI_COOKIE})
+
     def _handle_change_login(self):
         """修改面板登录账号/密码（需已登录会话）。"""
         if not _webui_check_cookie(self._cookie()):
@@ -974,6 +983,8 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if match_key(path, "login"):
             self._handle_login_post()
+        elif match_key(path, "logout"):
+            self._handle_logout()
         elif match_key(path, "change-login"):
             self._handle_change_login()
         elif match_key(path, "config"):
@@ -1111,7 +1122,9 @@ tr:hover td{background:rgba(255,255,255,.02)}
 <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#0a84ff" stroke-width="2"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>
 <div><h1>AI Proxy</h1><div class="sub">WorkBuddy + TraeWork 多平台 AI 代理</div></div></div>
 <div class="hd-right"><span class="pill"><span class="dot" id="srvDot"></span><span id="srvTxt">检测中…</span></span>
-<button class="btn btn-pri" onclick="refreshAll()">刷新</button></div></header>
+<span class="pill" id="loginUser" style="display:none"></span>
+<button class="btn btn-pri" onclick="refreshAll()">刷新</button>
+<button class="btn btn-warn" id="btnLogout" onclick="doLogout()" style="display:none">退出登录</button></div></header>
 <nav class="tabs">
 <button class="tab active" data-p="overview" onclick="switchPanel('overview')">概览</button>
 <button class="tab" data-p="accounts" onclick="switchPanel('accounts')">账号</button>
@@ -1350,7 +1363,7 @@ async function qoderLogin(){show('正在获取 Qoder 授权链接…');const d=a
 showBoxLink(d.url,'<b>Qoder 登录</b>：请在浏览器打开下方链接完成登录（支持账号/扫码/手机号）。登录完成后回到本页点击下方按钮。<br><a href="'+esc(d.url)+'" target="_blank">浏览器中打开授权链接</a>');addBtn('完成 Qoder 登录',pollQoder);}
 async function pollQoder(){show('正在确认 Qoder 登录…');const d=await api('qoder-poll',{method:'POST'});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error||'Qoder 登录尚未完成');toast(d.error||'Qoder 登录尚未完成','err');}}
 async function poll(key){show('正在确认登录…');const d=await api(key,{method:'POST'});if(d.success){show(d.message);toast(d.message,'ok');setTimeout(loadAccounts,1500);}else{show(d.error);toast(d.error,'err');}}
-function qrURL(u){return 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data='+encodeURIComponent(u);}
+function qrURL(u){return 'wb-api/qr?data='+encodeURIComponent(u);}
 function show(m){document.getElementById('loginHint').textContent=m;}
 function showBoxQR(url,note){document.getElementById('loginShow').innerHTML='<div class="qr"><img src="'+qrURL(url)+'" alt="扫码"/></div><div class="hint" style="margin-top:8px">'+note+'<br><a href="'+esc(url)+'" target="_blank">浏览器打开授权链接</a></div>';}
 function showBoxLink(url,note){document.getElementById('loginShow').innerHTML='<div class="hint">'+note+'</div><p><a href="'+esc(url)+'" target="_blank">'+esc(url)+'</a></p>';}
@@ -1360,11 +1373,13 @@ if(d.error){info.textContent='模型接口不可用: '+esc(d.error);body.innerHT
 const data=d.data||[];body.innerHTML=data.map(m=>'<tr><td>'+(m.owned_by?('<span class="badge '+(m.owned_by==='traework'?'b-info':'b-ok')+'">'+esc(m.owned_by)+'</span> '):'')+'<code>'+esc(m.id)+'</code></td><td>'+(m.context_length||'—')+'</td><td>'+(m.max_output_tokens||'—')+'</td></tr>').join('');empty.style.display=data.length?'none':'block';info.textContent='共 '+data.length+' 个模型';}
 async function loadSettings(){const d=await api('config');if(d.error){toast(d.error,'err');return;}const o=d.options||{};const set=(id,v)=>document.getElementById(id).value=(v===undefined||v===null)?'':v;
 set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
+async function doLogout(){const d=await api('logout',{method:'POST'});if(d.clear_cookie){document.cookie=d.clear_cookie+'=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT';}location.reload();}
+function showLoginUser(){var u=(document.getElementById('loginUser'));if(u){var n=(document.getElementById('f_webui_user')||{}).value||'admin';u.textContent='已登录: '+n;u.style.display='inline-block';}var b=document.getElementById('btnLogout');if(b)b.style.display='inline-block';}
 async function changeLogin(){const u=(document.getElementById('f_webui_user')||{}).value||'';const p=(document.getElementById('f_webui_pass')||{}).value||'';if(!u){toast('请填写登录名','err');return;}const d=await api('change-login',{method:'POST',body:{user:u,pass:p}});toast(d.message||d.error,d.success?'ok':'err');if(d.success){document.getElementById('f_webui_user').value='';document.getElementById('f_webui_pass').value='';}}
 async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
 opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
-loadOverview(true);</script></body></html>"""
+loadOverview(true);showLoginUser();</script></body></html>"""
 
 
 # ---------------------------------------------------------------------------
