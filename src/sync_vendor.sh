@@ -34,6 +34,7 @@ PROTECT_FILES=(
   "internal/login_trae/addon_extras.go"
   "internal/svc/svc.go"
   "internal/upstream/headers.go"
+  "internal/traework/constants.go"
 )
 
 echo "==> upstream HEAD: ${COMMIT}"

@@ -16,7 +16,7 @@ const (
 	DeviceBrand    = "20Y5A002XX"   // 设备机型示例（指纹头用，可替换为真实机型，无需精确匹配）
 	OSVersion      = "Windows 10 Pro" // 真实客户端系统版本
 	PluginVersion  = "2.3.73734"     // 真实客户端插件版本（登录 URL 用）
-	Function       = "solo_work_lite"
+	Function       = "solo_agent_lite"
 
 	EpChat          = "/api/agent/v3/llm_utils_chat"
 	EpModels        = "/api/ide/v1/get_detail_param"
