@@ -218,3 +218,35 @@ WorkBuddy 用量统计的「客户端」列读取请求头 `X-IDE-Type` / `X-IDE
 
 > 部署：`app_9a112f41_ai-proxy`（端口 7870）跑 `9a112f41/aarch64-addon-ai-proxy:1.0.5`（healthy）。
 > 注意：WorkBuddy 账号池需重启 serverd 才能重新扫描 auth 目录（state 文件持久化）。
+## TraeWork 通道（function）实证研究（2026-08-31，HAR 抓包 + 官方客户端日志）
+
+> **背景**：addon 调用 traework 所有模型均报 `code=4008 "Your requests have exceeded the quota"`；
+> 同时官方 TraeWork 客户端（TRAE SOLO CN）能正常使用 code/work/design 模型。
+
+### 通道清单（官方客户端 `batch_get_detail_param` 明文响应实证）
+
+| function（通道） | 模型数 | 说明 |
+|---|---|---|
+| `solo_agent_lite` | 38 | **官方客户端实际在用的通道**（用户会话 agentType 大量是它） |
+| `solo_coder` | 44 | Coder 通道（模型最多） |
+| `solo_agent_remote` | 38 | Agent remote 版 |
+| `solo_work_lite` | 39 | **addon 原用的通道 → 报 4008** |
+| `solo_work_remote` | 39 | Work remote 版 |
+| `solo_design_lite` / `solo_design_remote` | 24 | Design 通道 |
+| `assistant` | 12 | 助手通道 |
+| `builder` | 33 | Builder 通道 |
+
+**关键实证结论**：
+1. **模型不是问题**：`deepseek-v4-flash`/`glm-5.2` 等模型**几乎在所有通道都存在**（assistant、solo_agent_lite、solo_coder、solo_work_lite、solo_design_lite、builder 等全包含）。
+2. **4008 是通道配额问题**：`solo_work_lite` 通道本身被配额限制（quota exceeded），与账号积分无关。
+3. **Work 积分是通用的**：官方客户端里 Work 积分可在 Code/Work/Design 各通道使用（积分包 `no_bonus_quota: true`，无法区分 Work/Code 专属积分，各通道共享同一批积分）。
+4. **官方客户端实际用 `solo_agent_lite`**：renderer.log 显示用户会话 `agentType` 主要为 `solo_agent_lite`（模型 DeepSeek-V4-Flash、glm-5.1 等）；而 `solo_work_lite` 对应的 modelId 为空（未实际使用）。
+
+### 修复
+
+把 `internal/traework/constants.go` 的 `Function` 从 `"solo_work_lite"` 改为 `"solo_agent_lite"`（对齐官方客户端实际通道）。
+该文件已加入 `sync_vendor.sh` 的 `PROTECT_FILES`（addon 独有，不被上游覆盖）。
+
+> 注：TraeWork 的 chat 请求体是**加密的**（HAR 中 `llm_utils_chat` 的 body 为密文），
+> 无法直接读出 function；通道结论来自（a）`batch_get_detail_param` 明文响应中的通道/模型映射，
+> （b）官方客户端 `renderer.log` 中会话的 `agentType`/modelId 记录。
