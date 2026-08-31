@@ -694,6 +694,26 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     def _handle_config_get(self):
         self._send_json({"options": load_options(), "config_file": CONFIG_FILE})
 
+    def _handle_change_login(self):
+        """修改面板登录账号/密码（需已登录会话）。"""
+        if not _webui_check_cookie(self._cookie()):
+            self._send_json({"error": "未登录"}, 401)
+            return
+        body = read_body(self) or {}
+        new_user = (body.get("user") or "").strip()
+        new_pass = (body.get("pass") or "").strip()
+        if not new_user:
+            self._send_json({"error": "登录名不能为空"}, 400)
+            return
+        o = load_options()
+        if new_pass:
+            o["webui_user"] = new_user
+            o["webui_pass"] = new_pass
+        else:
+            o["webui_user"] = new_user  # 仅改登录名，密码保持
+        save_options(o)
+        self._send_json({"success": True, "message": "登录账号已更新，下次登录生效"})
+
     def _handle_config_save(self):
         body = read_body(self)
         incoming = body.get("options") or {}
@@ -954,6 +974,8 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if match_key(path, "login"):
             self._handle_login_post()
+        elif match_key(path, "change-login"):
+            self._handle_change_login()
         elif match_key(path, "config"):
             self._handle_config_save()
         elif match_key(path, "wb-poll"):
@@ -1168,6 +1190,12 @@ tr:hover td{background:rgba(255,255,255,.02)}
     <div class="field"><label>连续错误触发阈值</label><input id="f_cooldown_err_threshold" type="number" min="1"></div>
     <div class="field"><label>连续错误冷却时长</label><input id="f_cooldown_err_cooldown" placeholder="如 10m"></div>
   </div>
+  <div class="fsec"><h3>面板登录账号</h3>
+    <div class="field"><label>登录名</label><input id="f_webui_user" placeholder="面板登录账号"></div>
+    <div class="field"><label>新密码</label><input id="f_webui_pass" type="password" placeholder="面板登录密码（留空则不修改密码）"></div>
+    <div class="tbar"><button class="btn btn-warn" onclick="changeLogin()">保存登录账号</button></div>
+    <p class="hint" style="margin:8px 0 0">修改后立即生效；当前会话保持，下次登录用新账号。</p>
+  </div>
   <div class="fsec"><h3>定时任务</h3>
     <div class="field"><label>每日签到时刻（HH:MM，逗号分隔，两个平台共用）</label><input id="f_checkin_times" placeholder="如 09:00,21:00"></div>
     <div class="field"><label>Token 保活时刻（整点小时，逗号分隔）</label><input id="f_keepalive_hours" placeholder="如 22"></div>
@@ -1332,7 +1360,8 @@ if(d.error){info.textContent='模型接口不可用: '+esc(d.error);body.innerHT
 const data=d.data||[];body.innerHTML=data.map(m=>'<tr><td>'+(m.owned_by?('<span class="badge '+(m.owned_by==='traework'?'b-info':'b-ok')+'">'+esc(m.owned_by)+'</span> '):'')+'<code>'+esc(m.id)+'</code></td><td>'+(m.context_length||'—')+'</td><td>'+(m.max_output_tokens||'—')+'</td></tr>').join('');empty.style.display=data.length?'none':'block';info.textContent='共 '+data.length+' 个模型';}
 async function loadSettings(){const d=await api('config');if(d.error){toast(d.error,'err');return;}const o=d.options||{};const set=(id,v)=>document.getElementById(id).value=(v===undefined||v===null)?'':v;
 set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
-async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
+async async function changeLogin(){const u=(document.getElementById('f_webui_user')||{}).value||'';const p=(document.getElementById('f_webui_pass')||{}).value||'';if(!u){toast('请填写登录名','err');return;}const d=await api('change-login',{method:'POST',body:{user:u,pass:p}});toast(d.message||d.error,d.success?'ok':'err');if(d.success){document.getElementById('f_webui_user').value='';document.getElementById('f_webui_pass').value='';}}
+function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
 opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
 loadOverview(true);</script></body></html>"""
