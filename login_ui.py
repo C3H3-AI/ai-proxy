@@ -507,6 +507,19 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _clean_path(self, p):
+        """剥离 HA ingress 前缀（/api/hassio_ingress/<token>/），统一路由。"""
+        marker = "/hassio_ingress/"
+        idx = p.find(marker)
+        if idx != -1:
+            # 找到 /hassio_ingress/ 后，取其后第一段 token，再取之后路径
+            rest = p[idx + len(marker):]
+            slash = rest.find("/")
+            if slash != -1:
+                return rest[slash:] or "/"
+            return "/"
+        return p
+
     def _cookie(self):
         ck = self.headers.get("Cookie", "") or ""
         for part in ck.split(";"):
@@ -936,7 +949,7 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
 
     # ---- 路由 ----
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
+        path = self._clean_path(urllib.parse.urlparse(self.path).path)
         if path == "/healthz":
             self._send("OK", "text/plain")
         # ---- Web UI 面板登录门禁 ----
@@ -982,7 +995,7 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._send("404 Not Found", "text/plain", 404)
 
     def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
+        path = self._clean_path(urllib.parse.urlparse(self.path).path)
         if match_key(path, "login"):
             self._handle_login_post()
         elif match_key(path, "logout"):
