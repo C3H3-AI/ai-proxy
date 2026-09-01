@@ -940,7 +940,9 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send("OK", "text/plain")
         # ---- Web UI 面板登录门禁 ----
-        if path == "/" or path.endswith("/"):
+        # ingress 访问（如 /api/hassio_ingress/<token>/...）按面板首页处理：未登录返回登录页，不放行 401
+        is_ingress = path.startswith("/api/hassio_ingress/") or "/hassio_ingress/" in path
+        if path == "/" or path.endswith("/") or is_ingress:
             if _webui_enabled() and not _webui_check_cookie(self._cookie()):
                 self._send(LOGIN_PAGE, "text/html; charset=utf-8")
                 return
