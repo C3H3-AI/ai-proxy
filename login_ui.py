@@ -25,6 +25,8 @@ import urllib.request
 HOST = "0.0.0.0"
 PORT = 7870
 SRVD_PORT = 7864
+# HA 安装后的 addon slug（用于拼接公网反代路径，见下方「接入说明」）
+ADDON_SLUG = "9a112f41_ai-proxy"
 SRVD_UPSTREAM = "http://127.0.0.1:%d" % SRVD_PORT
 
 APP_DIR = "/app"
@@ -306,6 +308,9 @@ def overview_data():
         "last_error": G.last_error,
         "region": opts.get("region", "cn"),
         "api_key_set": bool(opts.get("api_key", "")),
+        "webui_user": (opts.get("webui_user") or "").strip() or "admin",
+        "webui_enabled": _webui_enabled(),
+        "slug": ADDON_SLUG,
         "port": PORT,
         "internal_port": SRVD_PORT,
         "account_total": total,
@@ -973,6 +978,8 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._handle_accounts()
         elif match_key(path, "models"):
             self._handle_models()
+        elif match_key(path, "fees"):
+            self._handle_fees()
         elif match_key(path, "config"):
             self._handle_config_get()
         elif match_key(path, "wb-url"):
@@ -1122,11 +1129,22 @@ tr:hover td{background:rgba(255,255,255,.02)}
 .field{margin-bottom:12px}
 .field label{display:block;font-size:12px;color:var(--sub);margin-bottom:5px}
 .field input,.field select{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:8px 10px;font-size:13px}
+.search{background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:7px 12px;font-size:13px;min-width:220px;max-width:100%}
+.search::placeholder{color:var(--sub)}
+.rate{color:var(--pri);font-weight:600;white-space:nowrap}
+.pwin{display:flex;gap:6px;align-items:center}
+.pwin input{flex:1}
 .fsec{margin-bottom:18px}
 .fsec h3{font-size:13px;color:var(--sub);margin:0 0 8px;border-bottom:1px solid var(--line);padding-bottom:6px}
 .login-box{background:var(--card2);border:1px dashed var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
 .qr{background:#fff;border-radius:10px;padding:12px;display:inline-block;text-align:center}
 .qr img{max-width:200px;border-radius:6px}
+.connrow{display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:12px;line-height:1.6}
+.connrow code{flex:0 0 76px;color:var(--pri)}
+.connrow .cpy{word-break:break-all;cursor:pointer;color:var(--txt)}
+.connrow .cpy:hover{color:var(--pri)}
+.connrow .cpy.warn{color:var(--warn)}
+textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:8px 10px;font-size:13px;box-sizing:border-box}
 .qr .ph{color:#999;font-size:13px}
 .empty{color:var(--sub);text-align:center;padding:24px;font-size:13px}
 .toast{position:fixed;top:16px;right:16px;z-index:999;display:flex;flex-direction:column;gap:8px}
@@ -1152,6 +1170,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
 <section class="panel active" id="panel-overview">
  <div class="cards" id="ovCards"></div>
  <div class="box"><h2>服务状态</h2><div class="hint" id="ovDetail"></div></div>
+ <div class="box"><h2>接入说明</h2><div class="hint" id="ovConnInfo">加载中…</div></div>
 </section>
 
 <section class="panel" id="panel-accounts">
@@ -1159,8 +1178,21 @@ tr:hover td{background:rgba(255,255,255,.02)}
    <b>添加账号</b>
    <div class="rowbtns" style="margin-top:8px">
      <button class="btn btn-pri" onclick="wbLogin()">WorkBuddy 扫码登录</button>
-     <button class="btn btn-info" onclick="traeLogin()">TraeWork 登录</button>
+     <button class="btn btn-info" onclick="traeTokenHelp()">TraeWork（填 Token）</button>
      <button class="btn btn-warn" onclick="qoderLogin()">Qoder 登录</button>
+   </div>
+   <div class="hint" id="traeTokenHelpBox" style="display:none;margin-top:10px;padding:12px;background:var(--card);border:1px solid var(--line);border-radius:8px;line-height:1.7">
+     <b style="color:var(--info)">如何获取 TraeWork 的 refreshToken</b>
+     <ol style="margin:8px 0 0;padding-left:18px;font-size:12px;color:var(--txt)">
+       <li>在电脑上打开 <b>Trae 客户端</b>，登录你的 TraeWork 账号（手机号 / 抖音扫码 / 账号密码均可）。</li>
+       <li>按 <b>F12</b> 打开开发者工具，切到 <b>Network（网络）</b> 面板。</li>
+       <li>在 Trae 里随便发起一次对话或刷新页面，过滤 <code>auth</code> / <code>token</code> / <code>refresh</code> 关键字。</li>
+       <li>在任意请求的请求头或返回体里找到 <code>refresh_token</code> 字段，复制其值（一长串，通常很长）。</li>
+       <li>把该值粘贴到下方输入框，点「保存 TraeWork Token」。Token 长期有效，无需重复操作。</li>
+     </ol>
+     <div class="field" style="margin-top:10px"><label>refreshToken</label>
+       <textarea id="traeRt" rows="3" placeholder="粘贴 refresh_token 的值"></textarea></div>
+     <button class="btn btn-ok" onclick="submitTraeRefresh()">保存 TraeWork Token</button>
    </div>
    <div class="hint" id="loginHint" style="margin-top:8px"></div>
    <div id="loginShow"></div>
@@ -1189,7 +1221,16 @@ tr:hover td{background:rgba(255,255,255,.02)}
  <span class="hint" id="modelInfo"></span></div>
  <div class="box">
   <p class="hint" style="margin:0 0 8px">模型带来源前缀：<code>workbuddy/&lt;model&gt;</code>、<code>traework/&lt;model&gt;</code> 或 <code>qoder/&lt;model&gt;</code>。客户端调用时必须带前缀。</p>
-  <table><thead><tr><th>模型 ID</th><th>上下文(tokens)</th><th>最大输出(tokens)</th></tr></thead><tbody id="modelBody"></tbody></table>
+  <div class="tbar" style="margin-bottom:10px">
+   <div class="grp">
+    <button class="btn sm btn-pri" data-mf="all" onclick="setModelFilter('all',this)">全部</button>
+    <button class="btn sm btn-info" data-mf="workbuddy" onclick="setModelFilter('workbuddy',this)">WorkBuddy</button>
+    <button class="btn sm btn-info" data-mf="traework" onclick="setModelFilter('traework',this)">TraeWork</button>
+    <button class="btn sm btn-info" data-mf="qoder" onclick="setModelFilter('qoder',this)">Qoder</button>
+   </div>
+   <input id="modelSearch" class="search" placeholder="搜索模型 ID…" oninput="renderModels()">
+  </div>
+  <div id="modelGroups"></div>
   <div class="empty" id="modelEmpty" style="display:none">未加载到模型列表。</div>
  </div>
 </section>
@@ -1208,7 +1249,7 @@ tr:hover td{background:rgba(255,255,255,.02)}
  <div class="box"><h2>设置</h2>
   <p class="hint" style="margin:0 0 14px">保存后写入 <code>/data/options.json</code> 并热重启 serverd 生效（不影响本面板）。</p>
   <div class="fsec"><h3>通用</h3>
-    <div class="field"><label>API Key（留空则不鉴权）</label><input id="f_api_key" placeholder="OpenAI 客户端调用所需 Key"></div>
+    <div class="field"><label>API Key（留空则不鉴权）</label><div class="pwin"><input id="f_api_key" type="password" placeholder="OpenAI 客户端调用所需 Key" autocomplete="off"><button type="button" class="btn btn-info sm" onclick="toggleKey(this)" style="flex:0 0 auto">显示</button></div></div>
     <div class="field"><label>WorkBuddy 注册区域</label><select id="f_region"><option value="cn">cn</option><option value="global">global</option></select></div>
     <div class="field"><label>上游超时（秒）</label><input id="f_upstream_timeout" type="number" min="1" max="600"></div>
   </div>
@@ -1238,6 +1279,8 @@ let ovTimer=null;
 function toast(msg,type){const b=document.getElementById('toastBox');const t=document.createElement('div');t.className='t '+(type||'info');t.textContent=msg;b.appendChild(t);setTimeout(()=>{t.style.opacity=0;t.style.transition='opacity .3s';setTimeout(()=>t.remove(),300);},4200);}
 async function api(key,opts){opts=opts||{};try{const r=await fetch('wb-api/'+key,{method:opts.method||'GET',headers:opts.body?{'Content-Type':'application/json'}:{},body:opts.body?JSON.stringify(opts.body):undefined});const txt=await r.text();let d;try{d=JSON.parse(txt);}catch(e){d={error:txt,status:r.status};}return d;}catch(e){return{error:'网络错误: '+e.message};}}
 function esc(s){s=(s===null||s===undefined)?'':String(s);return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function copyTxt(el){if(!el)return;const t=(el.getAttribute('data-copy')||el.textContent||'').trim();if(!t)return;navigator.clipboard&&navigator.clipboard.writeText(t).then(()=>toast('已复制到剪贴板','ok')).catch(()=>toast('复制失败','err'));}
+function toggleKey(btn){const inp=document.getElementById('f_api_key');if(!inp)return;const show=inp.type==='password';inp.type=show?'text':'password';btn.textContent=show?'隐藏':'显示';}
 async function loadFees(){
   const box=document.getElementById('feesBox');
   if(!box) return;
@@ -1299,6 +1342,7 @@ function fmtT(v){if(!v)return '—';const t=new Date(v*1000);if(isNaN(t))return 
 function stateBadge(a){if(a.disabled)return '<span class="badge b-bad">已禁用</span>';if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');return '<span class="badge b-ok">可用</span>';}
 function tokenCell(a){let h='<span class="badge" style="background:rgba(255,255,255,.06);color:var(--sub)">无刷新令牌</span>';if(a.has_refresh){const left=(a.expires_at||0)-(Date.now()/1000);h=left<=0?'<span class="badge b-bad">已过期</span>':(left<86400?'<span class="badge b-warn">即将过期</span>':'<span class="badge b-info">正常</span>');}return fmtT(a.expires_at)+'<div class="hint">'+h+'</div>';}
 async function loadOverview(force){const d=await api('overview');if(d.error){toast(d.error,'err');return;}const dot=document.getElementById('srvDot'),txt=document.getElementById('srvTxt');dot.className='dot '+(d.server_up?'up':'down');txt.textContent=d.server_up?'运行中':'已停止';
+const u=document.getElementById('loginUser');if(u){u.textContent='已登录: '+esc(d.webui_user||'admin');u.style.display='inline-block';}
 const cards=[
 {l:'服务状态',v:d.server_up?'运行中':'已停止',c:d.server_up?'good':'bad'},
 {l:'账号总数',v:d.account_total,c:''},
@@ -1312,12 +1356,20 @@ const cards=[
 {l:'API Key',v:d.api_key_set?'已设置':'未设置',c:d.api_key_set?'good':'warn'}];
 document.getElementById('ovCards').innerHTML=cards.map(c=>'<div class="stat"><div class="lbl">'+c.l+'</div><div class="val '+c.c+'">'+c.v+'</div></div>').join('');
 document.getElementById('ovDetail').innerHTML=('端口 '+d.port+'（公开/ingress） / '+d.internal_port+'（内部）｜运行时长 '+d.uptime+'s<br>签到时刻：'+(d.checkin_times||[]).join('、')+'｜Token 保活：'+(d.keepalive_hours||[]).join('、')+' 点'+(d.server_up?'':('<br>⚠ '+esc(d.last_error||'进程异常'))));
+const isIngress=(location.pathname||'').indexOf('/api/hassio_ingress/')>=0;
+const apiUrl=isIngress?(location.origin+'/'+esc(d.slug||'')+'/v1'):((location.origin||'')+'/v1');
+const kb=document.getElementById('ovConnInfo');
+if(kb){kb.innerHTML=(isIngress?('<div class="hint" style="margin:0 0 8px;color:var(--warn)">⚠ 当前经 HA 侧边栏（ingress）访问：ingress 地址仅供面板浏览，API 客户端请用下方 Base URL（经反代直连 addon，靠 API Key 鉴权）。</div>'):'')
++'<div class="connrow"><code>Base URL</code><span class="cpy" onclick="copyTxt(this)">'+esc(apiUrl)+'</span></div>'
++'<div class="connrow"><code>API Key</code><span class="cpy'+(d.api_key_set?'':' warn')+'" onclick="copyTxt(this)">'+(d.api_key_set?'（见「设置」页或 HA 加载项配置；调用时需带 Bearer）':'未设置，请先到「设置」页填写或留空则不鉴权')+'</span></div>'
++'<div class="connrow"><code>示例</code><span>'+esc('curl '+apiUrl+'/chat/completions -H "Authorization: Bearer <API_KEY>" -d \'{"model":"workbuddy/glm-5.2","messages":[{"role":"user","content":"hi"}]}\'')+'</span></div>'
++'<div class="hint" style="margin-top:6px">客户端（OpenAI 兼容）填 Base URL 时加 <code>/v1</code>，模型名必须带来源前缀：<code>workbuddy/</code>、<code>traework/</code> 或 <code>qoder/</code>。</div>';}
 scheduleOv(!force);}
 function scheduleOv(c){if(ovTimer)clearTimeout(ovTimer);if(c)ovTimer=setTimeout(()=>loadOverview(false),6000);}
 async function loadAccounts(){const d=await api('accounts');const wbB=document.getElementById('wbBody'),trB=document.getElementById('trBody'),qdB=document.getElementById('qdBody'),empty=document.getElementById('acctEmpty'),cnt=document.getElementById('acctCount');if(d.error){toast(d.error,'err');return;}
 const accs=d.accounts||[];const wb=accs.filter(a=>a.kind==='workbuddy'),tr=accs.filter(a=>a.kind==='traework'),qd=accs.filter(a=>a.kind==='qoder');
 const isQ=a=>a.kind==='qoder';
-const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hint">'+esc(a.uid)+'</td><td><b>'+(a.credits||0).toLocaleString()+'</b></td><td>'+stateBadge(a)+'</td><td>'+tokenCell(a)+'</td><td><div class="rowbtns">'+
+const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hint">'+esc(a.uid)+'<button class="btn sm btn-ok" title="复制 UID" onclick="copyAcctValue(this,'+JSON.stringify(String(a.uid))+')">复制</button></td><td><b>'+(a.credits||0).toLocaleString()+'</b></td><td>'+stateBadge(a)+'</td><td>'+tokenCell(a)+'</td><td><div class="rowbtns">'+
 (isQ(a)?'':('<button class="btn sm btn-ok" onclick="acctAction(&#39;checkin&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">签到</button>'))+
 '<button class="btn sm btn-pri" onclick="acctAction(&#39;credits&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新积分</button>'+
 '<button class="btn sm btn-info" onclick="acctAction(&#39;refresh&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新Token</button>'+
@@ -1328,7 +1380,8 @@ cnt.textContent='账号：WorkBuddy '+wb.length+' / TraeWork '+tr.length+' / Qod
 async function acctAction(action,kind,uid){toast('正在执行…','info');const d=await api(action,{method:'POST',body:{platform:kind,uid:uid}});showBatch(d);setTimeout(loadAccounts,1200);}
 async function runAll(action,uid){if(!confirm('确定要对所有账号执行吗？'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{uid:''}});showBatch(d);setTimeout(loadAccounts,1300);}
 function showBatch(d){if(d.error){toast(d.error,'err');return;}const rs=d.results||[];if(!rs.length){toast(d.message||'完成','ok');return;}rs.forEach(r=>toast((r.ok?'✓ ':'✗ ')+'['+(r.kind||'')+'] '+r.uid+'：'+r.msg,r.ok?'ok':'err'));}
-async function delAcct(kind,uid){if(!confirm('确认删除该账号？'))return;const d=await api('delete',{method:'POST',body:{platform:kind,uid:uid}});toast(d.success?d.message:d.error,d.success?'ok':'err');setTimeout(loadAccounts,1500);}
+function copyAcctValue(el,val){if(!el||val===undefined||val===null)return;navigator.clipboard&&navigator.clipboard.writeText(String(val)).then(()=>toast('已复制','ok')).catch(()=>toast('复制失败','err'));}
+async function delAcct(kind,uid){const accs=(await api('accounts')).accounts||[];const a=accs.find(x=>x.kind===kind&&x.uid===uid);const nm=(a&&a.nickname)||uid;if(!confirm('确认删除账号「'+(nm||uid)+'」？\n删除后该账号将不再参与轮转，且需要重新登录才能恢复。'))return;const d=await api('delete',{method:'POST',body:{platform:kind,uid:uid}});toast(d.success?d.message:d.error,d.success?'ok':'err');setTimeout(loadAccounts,1500);}
 function qrURL(u){return 'wb-api/qr?data='+encodeURIComponent(u);}
 async function wbLogin(){show('正在获取 WorkBuddy 登录页…');const d=await api('wb-url');if(d.error){toast(d.error,'err');return;}
 const u=d.url||'';
@@ -1345,6 +1398,7 @@ async function autoPollWb(){if(wbStop)return;const d=await api('wb-poll',{method
 const em=(d.error||'').toLowerCase();if(em.includes('未完成')||em.includes('waiting')||em.includes('login ing'))return;wbStop=1;clearInterval(wbTimer);show(d.error||'登录失败');toast(d.error||'登录失败','err');}
 let _traePollTimer=null;
 function traeStopAutoPoll(){if(_traePollTimer){clearTimeout(_traePollTimer);_traePollTimer=null;}}
+function traeTokenHelp(){const b=document.getElementById('traeTokenHelpBox');if(b){b.style.display=(b.style.display==='none')?'block':'none';if(b.style.display==='block'){show('');document.getElementById('loginShow').innerHTML='';}}}
 async function traeLogin(){
   show('正在启动 TraeWork 登录…');
   const d=await api('trae-url');
@@ -1383,13 +1437,41 @@ function show(m){document.getElementById('loginHint').textContent=m;}
 function showBoxQR(url,note){document.getElementById('loginShow').innerHTML='<div class="qr"><img src="'+qrURL(url)+'" alt="扫码"/></div><div class="hint" style="margin-top:8px">'+note+'<br><a href="'+esc(url)+'" target="_blank">浏览器打开授权链接</a></div>';}
 function showBoxLink(url,note){document.getElementById('loginShow').innerHTML='<div class="hint">'+note+'</div><p><a href="'+esc(url)+'" target="_blank">'+esc(url)+'</a></p>';}
 function addBtn(label,fn){document.getElementById('loginShow').innerHTML+='<button class="btn btn-ok" id="loginDoneBtn" style="margin-top:8px">'+label+'</button>';document.getElementById('loginDoneBtn').onclick=fn;}
-async function loadModels(){const info=document.getElementById('modelInfo');info.textContent='加载中…';const d=await api('models');const body=document.getElementById('modelBody'),empty=document.getElementById('modelEmpty');
-if(d.error){info.textContent='模型接口不可用: '+esc(d.error);body.innerHTML='';empty.style.display='none';return;}
-const data=d.data||[];body.innerHTML=data.map(m=>'<tr><td>'+(m.owned_by?('<span class="badge '+(m.owned_by==='traework'?'b-info':'b-ok')+'">'+esc(m.owned_by)+'</span> '):'')+'<code>'+esc(m.id)+'</code></td><td>'+(m.context_length||'—')+'</td><td>'+(m.max_output_tokens||'—')+'</td></tr>').join('');empty.style.display=data.length?'none':'block';info.textContent='共 '+data.length+' 个模型';}
+let _models=[],_modelFilter='all',_rates={},_defRates={};
+async function loadModels(){const info=document.getElementById('modelInfo');info.textContent='加载中…';
+const [dm,df]=await Promise.all([api('models'),api('fees')]);
+const empty=document.getElementById('modelEmpty');
+if(dm.error){info.textContent='模型接口不可用: '+esc(dm.error);_models=[];_rates={};renderModels();empty.style.display='none';return;}
+_models=dm.data||[];buildRates(df);info.textContent='共 '+_models.length+' 个模型'+(df.error?('（费率未加载: '+esc(df.error)+'）'):'');renderModels();}
+function buildRates(df){_rates={};_defRates={};(df.channels||[]).forEach(ch=>{const c=(ch.channel||'').toLowerCase();(ch.models||[]).forEach(m=>{if(!m.model)return;const k=c+'/'+String(m.model).toLowerCase();_rates[k]={rate:m.rate,note:m.note||''};if(String(m.model).toLowerCase()==='default')_defRates[c]=_rates[k];});});}
+function rateCell(m){const src=(m.owned_by||m.owner||'').toLowerCase();const id=(m.id||'').toLowerCase();const bare=id.split('/').pop();
+let r=_rates[src+'/'+bare];let approx=false;let usedDefault=false;
+if(!r){const k=(Object.keys(_rates)||[]).filter(x=>x.startsWith(src+'/'+bare+'-'));if(k.length){r=_rates[k[0]];approx=true;}}
+if(r&&(!Number(r.rate))&&_defRates[src]){r={rate:_defRates[src].rate,note:'auto/默认'};usedDefault=true;}
+if(!r)return '<td class="hint">—</td>';
+const v=Number(r.rate)||0;let noteHtml='';
+if(r.note){// 非颜色格式的说明（如 auto/默认、夜间折扣）
+ const mm=r.note.match(/^(.*?):(#[0-9a-fA-F]{3,8})$/);
+ if(mm){noteHtml=' <span style="display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:middle;background:'+mm[2]+'" title="'+esc(r.note)+'"></span> '+esc(mm[1]);}
+ else{noteHtml=' <span class="hint" style="font-size:11px">'+esc(r.note)+'</span>';}}
+if(approx)noteHtml+=' <span class="hint" style="font-size:11px" title="按同名 -x 版本费率估算">(≈)</span>';
+return '<td><span class="rate">'+String(v)+'</span>'+noteHtml+'</td>';}
+function setModelFilter(f,btn){_modelFilter=f;document.querySelectorAll('[data-mf]').forEach(b=>b.classList.remove('btn-pri'));if(btn)btn.classList.add('btn-pri');renderModels();}
+function renderModels(){const groups=document.getElementById('modelGroups'),empty=document.getElementById('modelEmpty');
+const q=((document.getElementById('modelSearch')||{}).value||'').trim().toLowerCase();
+const list=_models.filter(m=>{const src=(m.owned_by||m.owner||'').toLowerCase();if(_modelFilter!=='all'&&src!==_modelFilter)return false;if(q&&!(m.id||'').toLowerCase().includes(q))return false;return true;});
+if(!groups){if(empty)empty.style.display=_models.length?'none':'block';return;}
+empty.style.display=_models.length?'none':'block';
+const by={};list.forEach(m=>{const k=(m.owned_by||m.owner||'other');(by[k]=by[k]||[]).push(m);});
+const names={workbuddy:'WorkBuddy',traework:'TraeWork',qoder:'Qoder',other:'其他'};
+let html='';
+for(const k of ['workbuddy','traework','qoder','other']){if(!by[k])continue;const ms=by[k];html+='<div class="subhead">'+esc(names[k]||k)+'（'+ms.length+'）</div><table><thead><tr><th>模型 ID</th><th>上下文(tokens)</th><th>最大输出(tokens)</th><th>费率</th></tr></thead><tbody>'+ms.map(m=>'<tr><td><code>'+esc(m.id)+'</code></td><td>'+(m.context_length||'—')+'</td><td>'+(m.max_output_tokens||'—')+'</td>'+rateCell(m)+'</tr>').join('')+'</tbody></table>';}
+if(!html)html='<p class="hint" style="text-align:center;padding:12px">没有匹配的模型。</p>';
+groups.innerHTML=html;}
 async function loadSettings(){const d=await api('config');if(d.error){toast(d.error,'err');return;}const o=d.options||{};const set=(id,v)=>document.getElementById(id).value=(v===undefined||v===null)?'':v;
 set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
 async function doLogout(){const d=await api('logout',{method:'POST'});if(d.clear_cookie){document.cookie=d.clear_cookie+'=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT';}location.reload();}
-function showLoginUser(){var u=(document.getElementById('loginUser'));if(u){var n=(document.getElementById('f_webui_user')||{}).value||'admin';u.textContent='已登录: '+n;u.style.display='inline-block';}var b=document.getElementById('btnLogout');if(b)b.style.display='inline-block';}
+function showLoginUser(){var u=document.getElementById('loginUser');if(u){u.textContent='已登录: admin';u.style.display='inline-block';}var b=document.getElementById('btnLogout');if(b)b.style.display='inline-block';}
 async function changeLogin(){const u=(document.getElementById('f_webui_user')||{}).value||'';const p=(document.getElementById('f_webui_pass')||{}).value||'';if(!u){toast('请填写登录名','err');return;}const d=await api('change-login',{method:'POST',body:{user:u,pass:p}});toast(d.message||d.error,d.success?'ok':'err');if(d.success){document.getElementById('f_webui_user').value='';document.getElementById('f_webui_pass').value='';}}
 async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
 opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
