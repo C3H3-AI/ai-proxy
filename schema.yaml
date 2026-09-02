@@ -1,4 +1,6 @@
 api_key: "password"
+webui_user: "str"
+webui_pass: "password"
 region: "list(cn|global)"
 cooldown_hard_credit: "str"
 cooldown_soft_rate: "str"

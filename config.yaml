@@ -25,6 +25,8 @@ map:
   - config:rw
 options:
   api_key: ""
+  webui_user: ""
+  webui_pass: ""
   region: "cn"
   cooldown_hard_credit: "12h"
   cooldown_soft_rate: "60s"
@@ -35,6 +37,8 @@ options:
   upstream_timeout: 120
 schema:
   api_key: "password"
+  webui_user: "str"
+  webui_pass: "password"
   region: "list(cn|global)"
   cooldown_hard_credit: "str"
   cooldown_soft_rate: "str"
