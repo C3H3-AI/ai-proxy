@@ -3,7 +3,8 @@
 把 **WorkBuddy / CodeBuddy + TraeWork(SOLO) + Qoder** 多账号聚合成 OpenAI 兼容 API，
 模型名加来源前缀自动路由；支持自动签到、多账号轮转、粘性路由。
 
-> 上游协议层来自 [wild-work](https://github.com/rockswang/wild-work)（对齐 commit `ad32896`），
+> 上游协议层来自 [wild-work](https://github.com/rockswang/wild-work)（基线 commit `ad32896`，
+> 积分相关接口已同步至 `c62d0bc`；详见 `UPSTREAM-GAP-ANALYSIS.md`），
 > 本 addon 在其基础上做**异地 HA 容器适配**（公网回调登录 + refreshToken 直登兜底）。
 
 ## 功能
@@ -23,11 +24,11 @@
    - `region`：`cn` / `global`
    - 轮转冷却：`cooldown_hard_credit` / `cooldown_soft_rate` / `cooldown_err_threshold` / `cooldown_err_cooldown`
    - `checkin_times`：每日签到时间（如 `09:00,21:00`）
-4. 启动 → 打开 Web UI（ingress 7863）→ 添加账号
+4. 启动 → 打开 Web UI（ingress 7870）→ 添加账号
 
 ## TraeWork 登录（容器适配要点）
 
-- **公网回调**：面板生成授权链接，回调指向 `http://<ha>:7863/api/trae-cb`（经 ingress 可达容器）
+- **公网回调**：面板生成授权链接，回调指向 `http://<ha>:7870/api/trae-cb`（经 ingress 可达容器）
 - **refreshToken 直登（最稳）**：在面板粘贴 refreshToken 直接换 token，无需浏览器回调
 - 不要相信"授权页硬性绑定 127.0.0.1"的说法——真实抓包证明公网/localhost 回调均可交付 token
 
@@ -60,4 +61,8 @@ GOPROXY=https://goproxy.cn,direct GOSUMDB=off go build ./... && go vet ./...
 
 ## 版本
 
-当前 `v1.0.1`。详见 `CHANGELOG.md`。
+当前 `v1.0.5`。详见 `CHANGELOG.md`。
+
+> ⚠️ HA 加载项商店里的 `2.0.1` 构建（源仓库 `C3H3-AI/ai-proxy-test`）**落后于本仓库**——
+> 它停在 2026-08-27，不含 TraeWork 通道修复（4008）、WorkBuddy 客户端识别头、
+> 面板登录鉴权等 8/30 之后的改动。安装它会造成功能回退，请勿升级。
