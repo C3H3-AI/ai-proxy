@@ -63,6 +63,10 @@ GOPROXY=https://goproxy.cn,direct GOSUMDB=off go build ./... && go vet ./...
 
 当前 `v1.0.5`。详见 `CHANGELOG.md`。
 
-> ⚠️ HA 加载项商店里的 `2.0.1` 构建（源仓库 `C3H3-AI/ai-proxy-test`）**落后于本仓库**——
+> ⚠️ 另一个仓库 `C3H3-AI/ai-proxy-test` 提供的是 `2.0.1` 构建，**落后于本仓库**——
 > 它停在 2026-08-27，不含 TraeWork 通道修复（4008）、WorkBuddy 客户端识别头、
-> 面板登录鉴权等 8/30 之后的改动。安装它会造成功能回退，请勿升级。
+> 面板登录鉴权等 8/30 之后的改动，且 addon 位于 `ai-proxy/` 子目录、
+> 构建上下文与本仓库不同（`COPY . /src` vs `COPY src /src`）。
+>
+> 若 HA 里添加过该仓库并看到 `2.0.1` 更新提示，请勿升级，以免功能回退。
+> 本仓库（addon 位于根目录）才是持续维护的版本。
