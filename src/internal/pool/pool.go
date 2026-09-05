@@ -43,6 +43,7 @@ type Status struct {
 	Until          time.Time `json:"until,omitempty"`
 	Reason         string    `json:"reason,omitempty"`
 	Disabled       bool      `json:"disabled"`
+	LowCredit      bool      `json:"low_credit"` // 积分低于阈值，仅限 0 费率模型
 	ErrCount       int       `json:"err_count,omitempty"`
 	LastCheckinOK  bool      `json:"last_checkin_ok,omitempty"`
 	LastCheckinAt  time.Time `json:"last_checkin_at,omitempty"`
@@ -53,6 +54,7 @@ type entry struct {
 	a        *auth.Auth
 	credits  int64
 	disabled bool
+	lowCredit bool // 积分低于阈值，仅限 0 费率模型
 	reason   string
 	until    time.Time
 	errCount int
@@ -76,6 +78,7 @@ func (e *entry) healthy(now time.Time) bool {
 type accountState struct {
 	Credits        int64     `json:"credits"`
 	Disabled       bool      `json:"disabled"`
+	LowCredit      bool      `json:"low_credit"`
 	Reason         string    `json:"reason,omitempty"`
 	Until          time.Time `json:"until,omitempty"`
 	LastCheckinOK  bool      `json:"last_checkin_ok,omitempty"`
@@ -92,15 +95,25 @@ type Pool struct {
 	mu      sync.RWMutex
 	byUID   map[string]*entry
 	stateFp string
+	// lowCredits 低积分阈值：积分低于该值时标记 lowCredit，仅限使用 0 费率模型。
+	// <=0 表示关闭该特性。默认 10。
+	lowCredits int64
 }
 
 // New 构建池；stateFp 非空时尝试加载旧状态。
 func New(stateFp string) *Pool {
-	p := &Pool{byUID: map[string]*entry{}, stateFp: stateFp}
+	p := &Pool{byUID: map[string]*entry{}, stateFp: stateFp, lowCredits: 10}
 	if stateFp != "" {
 		p.load()
 	}
 	return p
+}
+
+// SetLowCredits 设置低积分阈值；<=0 关闭低积分自动冷却。
+func (p *Pool) SetLowCredits(v int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lowCredits = v
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证。
@@ -134,13 +147,31 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	}
 }
 
-// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
+// Pick 返回 healthy 中积分最高的**非低积分**账号；无可用返回 nil。
+// 低积分账号（lowCredit）仅限通过 PickLowCredit 选取。
 func (p *Pool) Pick() *auth.Auth {
-	return p.PickExcluding(nil)
+	return p.pickExcluding(true, nil)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
+	return p.pickExcluding(true, tried)
+}
+
+// PickLowCredit 返回 healthy 中积分最高的低积分账号（用于 0 费率模型）；无可用返回 nil。
+func (p *Pool) PickLowCredit() *auth.Auth {
+	return p.pickExcluding(false, nil)
+}
+
+// PickExcludingLowCredit 同上，但跳过 tried 中的 uid。
+func (p *Pool) PickExcludingLowCredit(tried map[string]bool) *auth.Auth {
+	return p.pickExcluding(false, tried)
+}
+
+// pickExcluding 内部实现。
+//   - excludeLowCredit=true  → 排除低积分账号（用于付费模型）
+//   - excludeLowCredit=false → 只从低积分账号中选（用于 0 费率模型）
+func (p *Pool) pickExcluding(excludeLowCredit bool, tried map[string]bool) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -150,6 +181,12 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 			continue
 		}
 		if !e.healthy(now) {
+			continue
+		}
+		if excludeLowCredit && e.lowCredit {
+			continue
+		}
+		if !excludeLowCredit && !e.lowCredit {
 			continue
 		}
 		if best == nil || e.credits > best.credits {
@@ -195,17 +232,41 @@ func (p *Pool) Disable(uid, reason string) {
 	p.saveLocked()
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。
+// ReenableIfCredits 签到后更新余额并设置低积分标记：
+//   - remain > 0 → 解除冷却（健康）；
+//   - remain >= 0 且 remain < 低积分阈值 → 标记 lowCredit（仅限 0 费率模型），
+//     否则清除 lowCredit 标记。
+// remain < 0（查询失败）时保留现有状态。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.credits = remain
-		if remain > 0 && !e.disabled {
-			e.until = time.Time{}
-			e.reason = ""
-			e.errCount = 0
-		}
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	e.credits = remain
+	if remain >= 0 && !e.disabled {
+		e.until = time.Time{}
+		e.reason = ""
+		e.errCount = 0
+	}
+	if p.lowCredits > 0 && remain >= 0 && remain < p.lowCredits && !e.disabled {
+		e.lowCredit = true
+	} else if remain >= 0 {
+		e.lowCredit = false
+	}
+	p.saveLocked()
+}
+
+// Unlock 手工解锁低积分账号：清除 lowCredit 标记与冷却截止，使其恢复为普通账号可用。
+func (p *Pool) Unlock(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && !e.disabled {
+		e.lowCredit = false
+		e.until = time.Time{}
+		e.reason = ""
+		e.errCount = 0
 	}
 	p.saveLocked()
 }
@@ -301,6 +362,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Until:          e.until,
 		Reason:         e.reason,
 		Disabled:       e.disabled,
+		LowCredit:      e.lowCredit,
 		ErrCount:       e.errCount,
 		LastCheckinOK:  e.lastCheckinOK,
 		LastCheckinAt:  e.lastCheckinAt,
@@ -326,6 +388,7 @@ func (p *Pool) load() {
 			a:              &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:        s.Credits,
 			disabled:       s.Disabled,
+			lowCredit:      s.LowCredit,
 			reason:         s.Reason,
 			until:          s.Until,
 			lastCheckinOK:  s.LastCheckinOK,
@@ -344,6 +407,7 @@ func (p *Pool) saveLocked() {
 		sf.Accounts[uid] = accountState{
 			Credits:        e.credits,
 			Disabled:       e.disabled,
+			LowCredit:      e.lowCredit,
 			Reason:         e.reason,
 			Until:          e.until,
 			LastCheckinOK:  e.lastCheckinOK,

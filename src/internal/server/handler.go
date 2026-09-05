@@ -46,6 +46,12 @@ type Config struct {
 	ErrThreshold int
 	ErrCooldown  time.Duration
 	RefreshSkew  time.Duration
+
+	// PricingFunc 返回指定渠道的模型定价列表（用于 auto 模型选择费率最低的模型）。
+	// 为 nil 时 auto 退化为第一个可用模型。
+	PricingFunc func(kind provider.Kind) []provider.ModelPricing
+	// AutoModels 每个渠道的 auto 候选模型白名单（空 = 使用定价列表全部）。
+	AutoModels map[provider.Kind][]string
 }
 
 // Handler 主路由。
@@ -86,6 +92,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("POST /api/accounts/unlock", h.withAuth(h.unlockAccount))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -105,32 +112,43 @@ type stickyEntry struct {
 func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
 
 // pickWithSticky 粘性路由选择账号。
+// freeModel=false 表示付费模型：仅高积分（非低积分）账号可用。
+// freeModel=true  表示 0 费率模型：高积分与低积分账号均可用，优先选取低积分账号，
+//                  无低积分账号时回退到高积分账号。
 // 优先使用上次成功路由的账号，直到：
-//   - 账号进入冷却/禁用状态
+//   - 账号进入冷却/禁用/未被当前模型模式允许
 //   - 连续成功请求达到 maxReqs 次（默认 50），自动轮换
-// 任一条件触发则降级为 Pick() 选新账号并重置粘性记录。
-func (h *Handler) pickWithSticky(rt *Runtime) *auth.Auth {
+// 任一条件触发则降级选新账号并重置粘性记录。
+func (h *Handler) pickWithSticky(rt *Runtime, freeModel bool) *auth.Auth {
 	const defaultMaxReqs = 50
 
 	h.stickyMu.RLock()
 	sticky := h.sticky[h.stickyKey(rt.Kind)]
 	h.stickyMu.RUnlock()
 
-	// 尝试粘性路由
+	// 尝试粘性路由：账号必须健康，且对当前模型模式可用（付费模型要求非低积分）
 	if sticky != nil && sticky.uid != "" && sticky.reqCount < sticky.maxReqs {
 		acct := rt.Pool.AuthByUID(sticky.uid)
 		if acct != nil {
 			status, ok := rt.Pool.Status(sticky.uid)
-			if ok && !status.Cooling && !status.Disabled {
-				log.Printf("sticky route platform=%s uid=%s count=%d/%d",
-					rt.Kind, sticky.uid, sticky.reqCount, sticky.maxReqs)
+			if ok && !status.Cooling && !status.Disabled && (freeModel || !status.LowCredit) {
+				log.Printf("sticky route platform=%s uid=%s count=%d/%d free_model=%v",
+					rt.Kind, sticky.uid, sticky.reqCount, sticky.maxReqs, freeModel)
 				return acct
 			}
 		}
 	}
 
-	// 降级：选择账号（Pick 内部按健康/余额策略）
-	acct := rt.Pool.Pick()
+	// 降级：选择账号
+	var acct *auth.Auth
+	if freeModel {
+		acct = rt.Pool.PickLowCredit() // 0 费率模型优先消耗低积分账号
+		if acct == nil {
+			acct = rt.Pool.Pick() // 无低积分账号时退回高积分账号
+		}
+	} else {
+		acct = rt.Pool.Pick()
+	}
 	if acct == nil {
 		return nil
 	}
@@ -139,7 +157,7 @@ func (h *Handler) pickWithSticky(rt *Runtime) *auth.Auth {
 	h.stickyMu.Lock()
 	h.sticky[h.stickyKey(rt.Kind)] = &stickyEntry{uid: acct.UID, maxReqs: defaultMaxReqs}
 	h.stickyMu.Unlock()
-	log.Printf("new sticky route platform=%s uid=%s maxReqs=%d", rt.Kind, acct.UID, defaultMaxReqs)
+	log.Printf("new sticky route platform=%s uid=%s maxReqs=%d free_model=%v", rt.Kind, acct.UID, defaultMaxReqs, freeModel)
 	return acct
 }
 
@@ -191,6 +209,39 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		accounts[k.String()] = rt.Pool.List()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
+}
+
+// unlockAccount 手工解锁低积分账号。body: {"kind":"workbuddy","uid":"..."}
+func (h *Handler) unlockAccount(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Kind string `json:"kind"`
+		UID  string `json:"uid"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
+		return
+	}
+	if req.Kind == "" || req.UID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "kind and uid are required"})
+		return
+	}
+	rt := h.cfg.Runtimes[provider.Kind(req.Kind)]
+	if rt == nil || rt.Pool == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not configured: " + req.Kind})
+		return
+	}
+	if _, ok := rt.Pool.Status(req.UID); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found: " + req.UID})
+		return
+	}
+	st, _ := rt.Pool.Status(req.UID)
+	if st.Disabled {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "account is permanently disabled, cannot unlock"})
+		return
+	}
+	rt.Pool.Unlock(req.UID)
+	st, _ = rt.Pool.Status(req.UID)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
 }
 
 var workbuddyStaticModels = []provider.ModelInfo{
@@ -306,6 +357,20 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 	return infos
 }
 
+// modelRate 从定价缓存中查询指定模型费率。返回 -1 表示未知（保守处理，视为付费模型）。
+func (h *Handler) modelRate(kind provider.Kind, model string) float64 {
+	if h.cfg.PricingFunc == nil {
+		return -1
+	}
+	pricing := h.cfg.PricingFunc(kind)
+	for _, p := range pricing {
+		if p.Model == model {
+			return p.Rate
+		}
+	}
+	return -1
+}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
@@ -328,17 +393,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 判断模型是否为 0 费率（免费）：
+	//   - 付费模型（rate>0 或未知）：仅高积分账号可用
+	//   - 免费模型（rate==0）：高积分与低积分账号均可用，优先消耗低积分账号
+	rate := h.modelRate(rt.Kind, model)
+	freeModel := rate == 0
+
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.pickWithSticky(rt)
+		acct := h.pickWithSticky(rt, freeModel)
 		if acct == nil {
 			break
 		}
 		if tried[acct.UID] {
 			// 粘性路由选回已尝试的账号，清除粘性记录后降级重选
 			h.stickyClear(rt)
-			acct = rt.Pool.PickExcluding(tried)
+			if freeModel {
+				acct = rt.Pool.PickExcludingLowCredit(tried)
+				if acct == nil {
+					acct = rt.Pool.PickExcluding(tried)
+				}
+			} else {
+				acct = rt.Pool.PickExcluding(tried)
+			}
 			if acct == nil {
 				break
 			}
@@ -377,7 +455,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := rt.Upstream.Classify(status, string(respBody))
 			switch kind {
 			case provider.ErrHardCredit:
-				rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
+				// 依据账号实际状态，而非模型费率，判断是否属于「免费额度已用完」：
+				// 低积分账号即使调用 0 费率模型仍报余额不足 → 禁用到次日自动恢复。
+				if st, ok := rt.Pool.Status(acct.UID); ok && st.LowCredit {
+					now := time.Now()
+					until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+					rt.Pool.Cooldown(acct.UID, pool.CoolHard, until.Sub(now), "免费额度已用完，次日恢复")
+				} else {
+					rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
+				}
 			case provider.ErrSoftRate:
 				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
 			case provider.ErrSessionDead:
@@ -426,7 +512,53 @@ func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
 	if len(rt.Pool.List()) == 0 {
 		return nil, "", fmt.Errorf("provider %q has no account", kind)
 	}
-	return rt, parts[1], nil
+	modelName := parts[1]
+	// auto 模型：选择费率最低的模型
+	if strings.EqualFold(modelName, "auto") {
+		resolved := h.resolveAutoModel(kind)
+		if resolved != "" {
+			log.Printf("auto model resolved platform=%s from=%s to=%s", kind, modelName, resolved)
+			modelName = resolved
+		}
+	}
+	return rt, modelName, nil
+}
+
+// resolveAutoModel 从定价缓存中选择费率最低的模型。
+// 返回空字符串时表示无法确定（调用方保留原模型名）。
+func (h *Handler) resolveAutoModel(kind provider.Kind) string {
+	if h.cfg.PricingFunc == nil {
+		return ""
+	}
+	pricing := h.cfg.PricingFunc(kind)
+	if len(pricing) == 0 {
+		return ""
+	}
+
+	// 候选白名单过滤
+	allowList := h.cfg.AutoModels[kind]
+	allowMap := make(map[string]bool, len(allowList))
+	for _, m := range allowList {
+		allowMap[m] = true
+	}
+
+	var best *provider.ModelPricing
+	for _, p := range pricing {
+		if p.Rate <= 0 {
+			continue // auto 本身或非计费模型不参与
+		}
+		if len(allowMap) > 0 && !allowMap[p.Model] {
+			continue // 不在白名单中
+		}
+		if best == nil || p.Rate < best.Rate {
+			best = &provider.ModelPricing{Model: p.Model, Rate: p.Rate, Channel: p.Channel}
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	log.Printf("auto model picked platform=%s model=%s rate=%.2f", kind, best.Model, best.Rate)
+	return best.Model
 }
 
 func rewriteModel(body []byte, model string) ([]byte, error) {

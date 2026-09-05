@@ -66,14 +66,17 @@ func New(cfg *config.Config) (*Runtime, error) {
 	}
 
 	wbPool := pool.New(filepath.Join(stateDir, "state-workbuddy.json"))
+	wbPool.SetLowCredits(cfg.LowCreditThreshold)
 	for _, a := range wbAuths {
 		wbPool.Add(a)
 	}
 	trPool := pool.New(filepath.Join(stateDir, "state-traework.json"))
+	trPool.SetLowCredits(cfg.LowCreditThreshold)
 	for _, a := range trAuths {
 		trPool.Add(a)
 	}
 	qdPool := pool.New(filepath.Join(stateDir, "state-qoder.json"))
+	qdPool.SetLowCredits(cfg.LowCreditThreshold)
 	for _, a := range qdAuths {
 		qoder.EnsureFingerprint(a) // 老凭证补机器指纹
 		qdPool.Add(a)
@@ -349,6 +352,24 @@ func shortErr(err error) string {
 		msg = msg[:160]
 	}
 	return msg
+}
+
+// PricingForChannel 返回指定渠道的模型定价列表（只读快照）。
+// 用于 auto 模型选择费率最低的模型。
+func (r *Runtime) PricingForChannel(channel string) []provider.ModelPricing {
+	r.pricingMu.RLock()
+	cached := r.pricingCache
+	r.pricingMu.RUnlock()
+	if len(cached) == 0 {
+		return nil
+	}
+	out := make([]provider.ModelPricing, 0, len(cached))
+	for _, p := range cached {
+		if p.Channel == channel {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // loadPricing 初始化费率缓存路径并载入磁盘缓存。

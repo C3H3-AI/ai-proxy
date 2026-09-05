@@ -94,6 +94,10 @@ type Config struct {
 	StateFile string `json:"state_file"` // ./data/state.json
 	Region    string `json:"region"`     // 只收 "cn"
 
+	// LowCreditThreshold 低积分阈值：账号积分低于该值时自动冷却到次日（reason=low_credits），
+	// 可手工解锁。<=0 关闭该特性。默认 10。
+	LowCreditThreshold int64 `json:"low_credit_threshold"`
+
 	Cooldown struct {
 		HardCredit  string `json:"hard_credit"`   // "12h"
 		SoftRate    string `json:"soft_rate"`     // "60s"
@@ -111,6 +115,12 @@ type Config struct {
 		TimeoutSeconds int `json:"timeout_seconds"` // 默认 120
 	} `json:"upstream"`
 
+	AutoModel struct {
+		WorkBuddyModels []string `json:"workbuddy_models,omitempty"` // workbuddy auto 候选模型白名单
+		TraeWorkModels  []string `json:"traework_models,omitempty"`  // traework auto 候选模型白名单
+		QoderModels     []string `json:"qoder_models,omitempty"`     // qoder auto 候选模型白名单
+	} `json:"auto_model"`
+
 	// 解析后
 	HardCreditDur  time.Duration `json:"-"`
 	SoftRateDur    time.Duration `json:"-"`
@@ -126,12 +136,13 @@ func Default() *Config {
 		StateFile: "./data/state.json",
 		Region:    "cn",
 	}
+	c.LowCreditThreshold = 10
 	c.Cooldown.HardCredit = "12h"
 	c.Cooldown.SoftRate = "60s"
 	c.Cooldown.ErrThresh = 3
 	c.Cooldown.ErrCooldown = "10m"
-	c.Schedule.CheckinHours = []int{9, 21}
-	c.Schedule.CheckinTimes = []string{"09:00", "21:00"}
+	c.Schedule.CheckinHours = []int{0, 9, 21}
+	c.Schedule.CheckinTimes = []string{"00:00", "09:00", "21:00"}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Upstream.TimeoutSeconds = 120
 	return c

@@ -50,6 +50,18 @@ func main() {
 		provider.TraeWork:  {Kind: provider.TraeWork, Pool: r.TraeWorkPool, Upstream: r.TraeWorkUpstream, StaticModels: server.TraeWorkStaticModels()},
 		provider.Qoder:     {Kind: provider.Qoder, Pool: r.QoderPool, Upstream: r.QoderUpstream, StaticModels: qoder.StaticModels()},
 	}
+	// auto 模型候选白名单
+	autoModels := map[provider.Kind][]string{}
+	if len(cfg.AutoModel.WorkBuddyModels) > 0 {
+		autoModels[provider.WorkBuddy] = cfg.AutoModel.WorkBuddyModels
+	}
+	if len(cfg.AutoModel.TraeWorkModels) > 0 {
+		autoModels[provider.TraeWork] = cfg.AutoModel.TraeWorkModels
+	}
+	if len(cfg.AutoModel.QoderModels) > 0 {
+		autoModels[provider.Qoder] = cfg.AutoModel.QoderModels
+	}
+
 	h := server.NewHandler(server.Config{
 		Runtimes:     runtimes,
 		APIKey:       cfg.APIKey,
@@ -57,6 +69,10 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		ErrThreshold: cfg.Cooldown.ErrThresh,
 		ErrCooldown:  cfg.ErrCooldownDur,
+		PricingFunc: func(kind provider.Kind) []provider.ModelPricing {
+			return r.PricingForChannel(kind.String())
+		},
+		AutoModels: autoModels,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

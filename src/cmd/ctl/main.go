@@ -7,6 +7,7 @@
 //	ctl -mode=credits   [-p=...] [-uid=...]
 //	ctl -mode=checkin   [-p=...] [-uid=...]
 //	ctl -mode=refresh   [-p=...] [-uid=...]
+//	ctl -mode=unlock    [-p=...] [-uid=...]  （解除低积分冷却）
 //
 // -p 缺省为 both（两平台都处理）；-uid 缺省为全部账号。
 package main
@@ -30,7 +31,7 @@ func main() {
 	log.SetOutput(os.Stderr) // 进度日志走 stderr，不污染 stdout JSON
 
 	cfgPath := flag.String("config", "config.json", "path to config json")
-	mode := flag.String("mode", "accounts", "accounts|credits|checkin|refresh")
+	mode := flag.String("mode", "accounts", "accounts|credits|checkin|refresh|unlock")
 	p := flag.String("p", "", "platform: workbuddy|traework (empty=both)")
 	uid := flag.String("uid", "", "account uid (empty=all)")
 	flag.Parse()
@@ -60,6 +61,8 @@ func main() {
 		out = collectCheckin(r, wantKind(*p), *uid)
 	case "refresh":
 		out = collectRefresh(r, wantKind(*p), *uid)
+	case "unlock":
+		out = collectUnlock(r, wantKind(*p), *uid)
 	default:
 		fatalf("unknown mode %q", *mode)
 	}
@@ -88,21 +91,57 @@ func matchKind(ks []provider.Kind, k provider.Kind) bool {
 	return false
 }
 
+// ---------- unlock ----------
+type outUnlock = outCredit
+
+// collectUnlock 手工解锁低积分账号或冷却账号；永久禁用(disabled)的账号不可解锁。
+func collectUnlock(r *svc.Runtime, ks []provider.Kind, uid string) []outUnlock {
+	var out []outUnlock
+	for _, k := range kinds {
+		if !matchKind(ks, k) {
+			continue
+		}
+		pl := r.Pool(k)
+		for _, st := range pl.List() {
+			if uid != "" && st.UID != uid {
+				continue
+			}
+			o := outUnlock{Kind: k.String(), UID: st.UID, Nickname: st.Nickname, Credits: st.Credits}
+			if st.Disabled {
+				o.Msg = "账号已永久禁用，无法解锁"
+				out = append(out, o)
+				continue
+			}
+			if !st.Cooling && !st.LowCredit {
+				o.Msg = "账号未在冷却且非低积分，无需解锁"
+				out = append(out, o)
+				continue
+			}
+			pl.Unlock(st.UID)
+			o.OK = true
+			o.Msg = "已解锁"
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // ---------- accounts ----------
 type outAccount struct {
-	Kind         string `json:"kind"`
-	UID          string `json:"uid"`
-	Nickname     string `json:"nickname"`
-	Credits      int64  `json:"credits"`
-	Cooling      bool   `json:"cooling"`
-	Disabled     bool   `json:"disabled"`
-	Reason       string `json:"reason,omitempty"`
-	Until        string `json:"until,omitempty"`
-	HasRefresh   bool   `json:"has_refresh"`
-	RefreshToken string `json:"-"`
-	ExpiresAt    int64  `json:"expires_at"`
-	Domain       string `json:"domain,omitempty"`
-}
+		Kind         string `json:"kind"`
+		UID          string `json:"uid"`
+		Nickname     string `json:"nickname"`
+		Credits      int64  `json:"credits"`
+		Cooling      bool   `json:"cooling"`
+		Disabled     bool   `json:"disabled"`
+		LowCredit    bool   `json:"low_credit"`
+		Reason       string `json:"reason,omitempty"`
+		Until        string `json:"until,omitempty"`
+		HasRefresh   bool   `json:"has_refresh"`
+		RefreshToken string `json:"-"`
+		ExpiresAt    int64  `json:"expires_at"`
+		Domain       string `json:"domain,omitempty"`
+	}
 
 func collectAccounts(r *svc.Runtime, ks []provider.Kind, uid string) []outAccount {
 	var out []outAccount
@@ -122,6 +161,7 @@ func collectAccounts(r *svc.Runtime, ks []provider.Kind, uid string) []outAccoun
 				Credits:  st.Credits,
 				Cooling:  st.Cooling,
 				Disabled: st.Disabled,
+				LowCredit: st.LowCredit,
 				Reason:   st.Reason,
 			}
 			if !st.Until.IsZero() {

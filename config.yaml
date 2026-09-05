@@ -1,5 +1,5 @@
 name: "AI Proxy"
-version: "1.0.5"
+version: "1.1.0b1"
 slug: "ai-proxy"
 description: "多平台 AI 账号（WorkBuddy/CodeBuddy + TraeWork）聚合为 OpenAI 兼容 API，模型带来源前缀自动路由；自动签到、多账号轮转。"
 url: "https://github.com/C3H3-AI/ai-proxy"
@@ -32,9 +32,13 @@ options:
   cooldown_soft_rate: "60s"
   cooldown_err_threshold: 3
   cooldown_err_cooldown: "10m"
-  checkin_times: "09:00,21:00"
+  checkin_times: "00:00,09:00,21:00"
   keepalive_hours: "22"
   upstream_timeout: 120
+  low_credit_threshold: 10
+  auto_models_workbuddy: ""
+  auto_models_traework: ""
+  auto_models_qoder: ""
 schema:
   api_key: "password"
   webui_user: "str"
@@ -47,3 +51,7 @@ schema:
   checkin_times: "str"
   keepalive_hours: "str"
   upstream_timeout: "int"
+  low_credit_threshold: "int"
+  auto_models_workbuddy: "str"
+  auto_models_traework: "str"
+  auto_models_qoder: "str"

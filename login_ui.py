@@ -59,6 +59,10 @@ DEFAULT_OPTIONS = {
     "checkin_times": "09:00,21:00",
     "keepalive_hours": [22],
     "upstream_timeout": 120,
+    "low_credit_threshold": 10,
+    "auto_models_workbuddy": "",
+    "auto_models_traework": "",
+    "auto_models_qoder": "",
 }
 
 PROXY_PREFIX = "/v1/"
@@ -133,7 +137,7 @@ def normalize_checkin_times(v):
         return [str(x) for x in v]
     if isinstance(v, str):
         return [x.strip() for x in v.replace("，", ",").split(",") if x.strip()]
-    return ["09:00", "21:00"]
+    return ["00:00", "09:00", "21:00"]
 
 
 def normalize_hours(v):
@@ -142,6 +146,15 @@ def normalize_hours(v):
     if isinstance(v, str):
         return [int(x) for x in v.replace("，", ",").split(",") if str(x).strip()]
     return [22]
+
+
+def parse_csv_list(v):
+    """将逗号分隔的字符串解析为列表，过滤空值。"""
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        return [x.strip() for x in v.replace("，", ",").split(",") if x.strip()]
+    return []
 
 
 def build_config(opts):
@@ -163,6 +176,12 @@ def build_config(opts):
             "keepalive_hours": normalize_hours(opts.get("keepalive_hours")),
         },
         "upstream": {"timeout_seconds": int(opts.get("upstream_timeout", 120))},
+        "low_credit_threshold": max(0, int(opts.get("low_credit_threshold", 10))),
+        "auto_model": {
+            "workbuddy_models": parse_csv_list(opts.get("auto_models_workbuddy", "")),
+            "traework_models": parse_csv_list(opts.get("auto_models_traework", "")),
+            "qoder_models": parse_csv_list(opts.get("auto_models_qoder", "")),
+        },
     }
 
 
@@ -1035,6 +1054,8 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._handle_action("refresh")
         elif match_key(path, "delete"):
             self._handle_delete()
+        elif match_key(path, "unlock"):
+            self._handle_action("unlock")
         elif path.startswith(PROXY_PREFIX):
             self._proxy("POST")
         else:
@@ -1258,6 +1279,7 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
     <div class="field"><label>限流(429)冷却时长</label><input id="f_cooldown_soft_rate" placeholder="如 60s"></div>
     <div class="field"><label>连续错误触发阈值</label><input id="f_cooldown_err_threshold" type="number" min="1"></div>
     <div class="field"><label>连续错误冷却时长</label><input id="f_cooldown_err_cooldown" placeholder="如 10m"></div>
+    <div class="field"><label>低积分阈值（低于此值自动禁用到次日，可手工解锁；填 0 关闭）</label><input id="f_low_credit_threshold" type="number" min="0"></div>
   </div>
   <div class="fsec"><h3>面板登录账号</h3>
     <div class="field"><label>登录名</label><input id="f_webui_user" placeholder="面板登录账号"></div>
@@ -1339,7 +1361,7 @@ function fmtRate(m){
 function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='fees')loadFees();if(n==='settings')loadSettings();}
 function refreshAll(){loadOverview(true);loadAccounts();}
 function fmtT(v){if(!v)return '—';const t=new Date(v*1000);if(isNaN(t))return String(v);return t.toLocaleString('zh-CN',{hour12:false});}
-function stateBadge(a){if(a.disabled)return '<span class="badge b-bad">已禁用</span>';if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');return '<span class="badge b-ok">可用</span>';}
+function stateBadge(a){if(a.disabled)return '<span class="badge b-bad">已禁用</span>';if(a.low_credit)return '<span class="badge b-warn">低积分</span><div class="hint">仅限 0 费率模型</div>';if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');return '<span class="badge b-ok">可用</span>';}
 function tokenCell(a){let h='<span class="badge" style="background:rgba(255,255,255,.06);color:var(--sub)">无刷新令牌</span>';if(a.has_refresh){const left=(a.expires_at||0)-(Date.now()/1000);h=left<=0?'<span class="badge b-bad">已过期</span>':(left<86400?'<span class="badge b-warn">即将过期</span>':'<span class="badge b-info">正常</span>');}return fmtT(a.expires_at)+'<div class="hint">'+h+'</div>';}
 async function loadOverview(force){const d=await api('overview');if(d.error){toast(d.error,'err');return;}const dot=document.getElementById('srvDot'),txt=document.getElementById('srvTxt');dot.className='dot '+(d.server_up?'up':'down');txt.textContent=d.server_up?'运行中':'已停止';
 const u=document.getElementById('loginUser');if(u){u.textContent='已登录: '+esc(d.webui_user||'admin');u.style.display='inline-block';}
@@ -1373,6 +1395,7 @@ const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hin
 (isQ(a)?'':('<button class="btn sm btn-ok" onclick="acctAction(&#39;checkin&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">签到</button>'))+
 '<button class="btn sm btn-pri" onclick="acctAction(&#39;credits&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新积分</button>'+
 '<button class="btn sm btn-info" onclick="acctAction(&#39;refresh&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新Token</button>'+
+((a.low_credit&&!a.disabled)?('<button class="btn sm btn-warn" title="解除低积分限制，立即恢复为普通账号" onclick="acctAction(&#39;unlock&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">解锁</button>'):'')+
 '<button class="btn sm btn-danger" onclick="delAcct(&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">删除</button></div></td></tr>';
 wbB.innerHTML=wb.map(row).join('');trB.innerHTML=tr.map(row).join('');qdB.innerHTML=qd.map(row).join('');
 empty.style.display=(wb.length+tr.length+qd.length)?'none':'block';
@@ -1469,12 +1492,12 @@ for(const k of ['workbuddy','traework','qoder','other']){if(!by[k])continue;cons
 if(!html)html='<p class="hint" style="text-align:center;padding:12px">没有匹配的模型。</p>';
 groups.innerHTML=html;}
 async function loadSettings(){const d=await api('config');if(d.error){toast(d.error,'err');return;}const o=d.options||{};const set=(id,v)=>document.getElementById(id).value=(v===undefined||v===null)?'':v;
-set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
+set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_low_credit_threshold',o.low_credit_threshold);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
 async function doLogout(){const d=await api('logout',{method:'POST'});if(d.clear_cookie){document.cookie=d.clear_cookie+'=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT';}location.reload();}
 function showLoginUser(){var u=document.getElementById('loginUser');if(u){u.textContent='已登录: admin';u.style.display='inline-block';}var b=document.getElementById('btnLogout');if(b)b.style.display='inline-block';}
 async function changeLogin(){const u=(document.getElementById('f_webui_user')||{}).value||'';const p=(document.getElementById('f_webui_pass')||{}).value||'';if(!u){toast('请填写登录名','err');return;}const d=await api('change-login',{method:'POST',body:{user:u,pass:p}});toast(d.message||d.error,d.success?'ok':'err');if(d.success){document.getElementById('f_webui_user').value='';document.getElementById('f_webui_pass').value='';}}
 async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
-opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
+opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
 loadOverview(true);showLoginUser();</script></body></html>"""
 

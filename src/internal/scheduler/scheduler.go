@@ -48,7 +48,7 @@ func New(cfg Config) *Scheduler {
 				}
 			}
 		} else {
-			cfg.CheckinMinutes = []int{9 * 60, 21 * 60}
+			cfg.CheckinMinutes = []int{0, 9 * 60, 21 * 60}
 		}
 	}
 	if len(cfg.KeepaliveHours) == 0 {
