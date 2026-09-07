@@ -1281,6 +1281,12 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
     <div class="field"><label>连续错误冷却时长</label><input id="f_cooldown_err_cooldown" placeholder="如 10m"></div>
     <div class="field"><label>低积分阈值（低于此值自动禁用到次日，可手工解锁；填 0 关闭）</label><input id="f_low_credit_threshold" type="number" min="0"></div>
   </div>
+  <div class="fsec"><h3>auto 模型候选白名单</h3>
+    <p class="hint" style="margin:0 0 10px">请求模型名 <code>&lt;平台&gt;/auto</code> 时，从下列白名单中选费率最低的模型；留空 = 该渠道所有计费模型均参与（0 费率模型始终不参与）。模型 ID 不带平台前缀，逗号分隔。</p>
+    <div class="field"><label>WorkBuddy 候选模型</label><input id="f_auto_models_workbuddy" placeholder="如 claude-sonnet-4-5,gpt-5.2（留空不限制）"></div>
+    <div class="field"><label>TraeWork 候选模型</label><input id="f_auto_models_traework" placeholder="如 doubao-seed-code（留空不限制）"></div>
+    <div class="field"><label>Qoder 候选模型</label><input id="f_auto_models_qoder" placeholder="留空不限制"></div>
+  </div>
   <div class="fsec"><h3>面板登录账号</h3>
     <div class="field"><label>登录名</label><input id="f_webui_user" placeholder="面板登录账号"></div>
     <div class="field"><label>新密码</label><input id="f_webui_pass" type="password" placeholder="面板登录密码（留空则不修改密码）"></div>
@@ -1492,12 +1498,12 @@ for(const k of ['workbuddy','traework','qoder','other']){if(!by[k])continue;cons
 if(!html)html='<p class="hint" style="text-align:center;padding:12px">没有匹配的模型。</p>';
 groups.innerHTML=html;}
 async function loadSettings(){const d=await api('config');if(d.error){toast(d.error,'err');return;}const o=d.options||{};const set=(id,v)=>document.getElementById(id).value=(v===undefined||v===null)?'':v;
-set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_low_credit_threshold',o.low_credit_threshold);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
+set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_low_credit_threshold',o.low_credit_threshold);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);set('f_auto_models_workbuddy',o.auto_models_workbuddy||'');set('f_auto_models_traework',o.auto_models_traework||'');set('f_auto_models_qoder',o.auto_models_qoder||'');}
 async function doLogout(){const d=await api('logout',{method:'POST'});if(d.clear_cookie){document.cookie=d.clear_cookie+'=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT';}location.reload();}
 function showLoginUser(){var u=document.getElementById('loginUser');if(u){u.textContent='已登录: admin';u.style.display='inline-block';}var b=document.getElementById('btnLogout');if(b)b.style.display='inline-block';}
 async function changeLogin(){const u=(document.getElementById('f_webui_user')||{}).value||'';const p=(document.getElementById('f_webui_pass')||{}).value||'';if(!u){toast('请填写登录名','err');return;}const d=await api('change-login',{method:'POST',body:{user:u,pass:p}});toast(d.message||d.error,d.success?'ok':'err');if(d.success){document.getElementById('f_webui_user').value='';document.getElementById('f_webui_pass').value='';}}
 async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
-opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
+opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');opt.auto_models_workbuddy=get('f_auto_models_workbuddy');opt.auto_models_traework=get('f_auto_models_traework');opt.auto_models_qoder=get('f_auto_models_qoder');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
 loadOverview(true);showLoginUser();</script></body></html>"""
 

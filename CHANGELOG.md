@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.0b2 (2026-09-07) 测试版
+
+### 新增
+- **设置页纳入 auto 候选白名单**：Web UI「设置」页新增「auto 模型候选白名单」分组，
+  `auto_models_workbuddy` / `auto_models_traework` / `auto_models_qoder` 三个字段
+  可直接在面板编辑（此前只能在 HA 加载项配置里改），保存后随 serverd 热重启生效。
+  至此全部运行配置均可在 Web UI 统一管理，HA 加载项配置页仅作初始值兜底。
+
 ## v1.1.0b1 (2026-09-05) 测试版
 
 ### 新增
