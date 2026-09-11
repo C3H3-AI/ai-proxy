@@ -1,7 +1,8 @@
-# AI Proxy — 多平台 AI 账号 OpenAI 兼容代理（HA Add-on）
+<img width="750" height="1110" alt="image" src="https://github.com/user-attachments/assets/4f077501-11cc-4947-9fc8-9e0f09dedf98" /># AI Proxy — 多平台 AI 账号 OpenAI 兼容代理（HA Add-on）
 
 把 **WorkBuddy / CodeBuddy + TraeWork(SOLO) + Qoder** 多账号聚合成 OpenAI 兼容 API，
 模型名加来源前缀自动路由；支持自动签到、多账号轮转、粘性路由。
+workbuddy注册邀请<img width="750" height="1110" alt="image" src="https://github.com/user-attachments/assets/b1208e4a-b0f8-4cff-96e3-bf291e3ae6d8" />https://www.workbuddy.cn/events/invite?inviteCode=r6pi8bgu2
 
 > 上游协议层来自 [wild-work](https://github.com/rockswang/wild-work)（基线 commit `ad32896`，
 > 积分相关接口已同步至 `c62d0bc`；详见 `UPSTREAM-GAP-ANALYSIS.md`），
