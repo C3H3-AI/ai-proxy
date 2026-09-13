@@ -271,6 +271,28 @@ func (p *Pool) Unlock(uid string) {
 	p.saveLocked()
 }
 
+// SetEnabled 手工禁用/启用账号（面板操作）。启用时同时清除冷却与低积分标记。
+func (p *Pool) SetEnabled(uid string, enabled bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	if enabled {
+		e.disabled = false
+		e.lowCredit = false
+		e.until = time.Time{}
+		e.reason = ""
+		e.errCount = 0
+	} else {
+		e.disabled = true
+		e.reason = "手工禁用"
+	}
+	p.saveLocked()
+	return true
+}
+
 // RecordCheckin 记录一次签到结果（含错误信息），随 state.json 持久化。
 func (p *Pool) RecordCheckin(uid string, ok bool, msg string) {
 	p.mu.Lock()

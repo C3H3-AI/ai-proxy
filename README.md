@@ -1,4 +1,4 @@
-<img width="750" height="1110" alt="image" src="https://github.com/user-attachments/assets/4f077501-11cc-4947-9fc8-9e0f09dedf98" /># AI Proxy — 多平台 AI 账号 OpenAI 兼容代理（HA Add-on）
+<img width="750" height="1110" alt="image" src="https://github.com/user-attachments/assets/4f077501-11cc-4947-9e0f09dedf98" /># AI Proxy — 多平台 AI 账号 OpenAI 兼容代理（HA Add-on）
 
 把 **WorkBuddy / CodeBuddy + TraeWork(SOLO) + Qoder** 多账号聚合成 OpenAI 兼容 API，
 模型名加来源前缀自动路由；支持自动签到、多账号轮转、粘性路由。
@@ -62,7 +62,11 @@ GOPROXY=https://goproxy.cn,direct GOSUMDB=off go build ./... && go vet ./...
 
 ## 版本
 
-当前 `v1.0.5`。详见 `CHANGELOG.md`。
+当前 `v1.1.0b3`。详见 `CHANGELOG.md`。
+
+> 安全提示：面板「设置」页务必配置 WebUI 登录账号/密码。若留空，管理接口仅允许
+> 本机 / HA 内网来源访问（公网直连 7870 会被拒绝 401）；配置了账号密码后任何来源
+> 均需登录。`/v1/*` OpenAI API 始终由 `api_key` 独立鉴权。
 
 > ⚠️ 另一个仓库 `C3H3-AI/ai-proxy-test` 提供的是 `2.0.1` 构建，**落后于本仓库**——
 > 它停在 2026-08-27，不含 TraeWork 通道修复（4008）、WorkBuddy 客户端识别头、

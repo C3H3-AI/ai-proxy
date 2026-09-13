@@ -47,10 +47,10 @@ type Config struct {
 	ErrCooldown  time.Duration
 	RefreshSkew  time.Duration
 
-	// PricingFunc 返回指定渠道的模型定价列表（用于 auto 模型选择费率最低的模型）。
-	// 为 nil 时 auto 退化为第一个可用模型。
+	// PricingFunc 返回指定渠道的模型定价列表（用于 cheapest 模型选择费率最低的模型）。
+	// 为 nil 时 cheapest 退化为第一个可用模型。
 	PricingFunc func(kind provider.Kind) []provider.ModelPricing
-	// AutoModels 每个渠道的 auto 候选模型白名单（空 = 使用定价列表全部）。
+	// AutoModels 每个渠道的 cheapest 候选模型白名单（空 = 使用定价列表全部）。
 	AutoModels map[provider.Kind][]string
 }
 
@@ -295,6 +295,11 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			out = append(out, entry)
 		}
+		// 虚拟 cheapest 模型：让客户端模型下拉框可直接选（请求时解析为最低费率模型）
+		out = append(out, map[string]any{
+			"id": k.String() + "/cheapest", "object": "model",
+			"created": 1753600000, "owned_by": k.String(),
+		})
 	}
 	return out
 }
@@ -513,11 +518,13 @@ func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
 		return nil, "", fmt.Errorf("provider %q has no account", kind)
 	}
 	modelName := parts[1]
-	// auto 模型：选择费率最低的模型
-	if strings.EqualFold(modelName, "auto") {
+	// cheapest 模型：选择费率最低的模型。
+	// 注意不用 "auto"——与 WorkBuddy 上游原生 auto 模型（平台智能路由）撞名，
+	// 本地拦截会让上游 auto 永远调不到；auto 现在直通上游。
+	if strings.EqualFold(modelName, "cheapest") {
 		resolved := h.resolveAutoModel(kind)
 		if resolved != "" {
-			log.Printf("auto model resolved platform=%s from=%s to=%s", kind, modelName, resolved)
+			log.Printf("cheapest model resolved platform=%s from=%s to=%s", kind, modelName, resolved)
 			modelName = resolved
 		}
 	}
@@ -545,7 +552,7 @@ func (h *Handler) resolveAutoModel(kind provider.Kind) string {
 	var best *provider.ModelPricing
 	for _, p := range pricing {
 		if p.Rate <= 0 {
-			continue // auto 本身或非计费模型不参与
+			continue // 非计费模型（含上游原生 auto）不参与
 		}
 		if len(allowMap) > 0 && !allowMap[p.Model] {
 			continue // 不在白名单中
@@ -557,7 +564,7 @@ func (h *Handler) resolveAutoModel(kind provider.Kind) string {
 	if best == nil {
 		return ""
 	}
-	log.Printf("auto model picked platform=%s model=%s rate=%.2f", kind, best.Model, best.Rate)
+	log.Printf("cheapest model picked platform=%s model=%s rate=%.2f", kind, best.Model, best.Rate)
 	return best.Model
 }
 

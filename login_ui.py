@@ -25,8 +25,9 @@ import urllib.request
 HOST = "0.0.0.0"
 PORT = 7870
 SRVD_PORT = 7864
-# HA 安装后的 addon slug（用于拼接公网反代路径，见下方「接入说明」）
-ADDON_SLUG = "9a112f41_ai-proxy"
+# HA 安装后的 addon slug（用于拼接公网反代路径，见下方「接入说明」）。
+# HA 在容器内注入 SLUG 环境变量，本地开发时回退到默认值。
+ADDON_SLUG = os.environ.get("SLUG") or "ai-proxy"
 SRVD_UPSTREAM = "http://127.0.0.1:%d" % SRVD_PORT
 
 APP_DIR = "/app"
@@ -56,7 +57,7 @@ DEFAULT_OPTIONS = {
     "cooldown_soft_rate": "60s",
     "cooldown_err_threshold": 3,
     "cooldown_err_cooldown": "10m",
-    "checkin_times": "09:00,21:00",
+    "checkin_times": "00:00,09:00,21:00",
     "keepalive_hours": [22],
     "upstream_timeout": 120,
     "low_credit_threshold": 10,
@@ -70,6 +71,36 @@ V1_RAW = ["/v1/models", "/status", "/healthz"]
 
 WEBUI_COOKIE = "ai_proxy_session"
 SESSION_FILE = "/tmp/ai-proxy-webui-session"
+
+
+# 登录失败限速：同 IP 连续失败 5 次后冷却 5 分钟
+_LOGIN_FAILS = {}  # ip -> [fail_count, first_fail_ts]
+LOGIN_FAIL_MAX = 5
+LOGIN_FAIL_WINDOW = 300
+
+
+def _login_rate_ok(ip):
+    rec = _LOGIN_FAILS.get(ip)
+    if not rec:
+        return True
+    fails, first_ts = rec
+    if time.time() - first_ts > LOGIN_FAIL_WINDOW:
+        del _LOGIN_FAILS[ip]
+        return True
+    return fails < LOGIN_FAIL_MAX
+
+
+def _login_record_fail(ip):
+    rec = _LOGIN_FAILS.get(ip)
+    now = time.time()
+    if rec and now - rec[1] <= LOGIN_FAIL_WINDOW:
+        rec[0] += 1
+    else:
+        _LOGIN_FAILS[ip] = [1, now]
+
+
+def _login_clear(ip):
+    _LOGIN_FAILS.pop(ip, None)
 
 
 def _webui_enabled():
@@ -210,9 +241,10 @@ class ServerMgr:
             if self.proc and self.proc.poll() is None:
                 self._kill_locked()
             try:
+                # serverd 日志接容器 stdout（HA addon logs 可见），便于排查路由/解析问题
                 self.proc = subprocess.Popen(
                     [SRVD_BIN, "-config", CONFIG_FILE],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=None, stderr=subprocess.STDOUT,
                 )
                 self.started = time.time()
                 self.last_error = ""
@@ -246,9 +278,10 @@ class ServerMgr:
             write_config(cfg)
             self._kill_locked()
             try:
+                # serverd 日志接容器 stdout（HA addon logs 可见），便于排查路由/解析问题
                 self.proc = subprocess.Popen(
                     [SRVD_BIN, "-config", CONFIG_FILE],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=None, stderr=subprocess.STDOUT,
                 )
                 self.started = time.time()
                 self.last_error = ""
@@ -327,6 +360,8 @@ def overview_data():
         "last_error": G.last_error,
         "region": opts.get("region", "cn"),
         "api_key_set": bool(opts.get("api_key", "")),
+        # 概览接口本身有门禁（登录或本地来源），带真实 key 供面板一键复制
+        "api_key": opts.get("api_key") or "",
         "webui_user": (opts.get("webui_user") or "").strip() or "admin",
         "webui_enabled": _webui_enabled(),
         "slug": ADDON_SLUG,
@@ -409,8 +444,14 @@ def trae_poll():
         return None, "TraeWork 登录结果解析失败"
 
 
+def sanitize_uid(uid):
+    """uid 仅允许字母数字下划线连字符@，防止经文件名路径穿越。"""
+    import re
+    return re.sub(r"[^A-Za-z0-9_\-@]", "_", str(uid or ""))
+
+
 def save_wb_auth(data):
-    uid = data.get("uid", "")
+    uid = sanitize_uid(data.get("uid", ""))
     if not uid:
         return False, "缺少 uid"
     doc = {
@@ -430,7 +471,7 @@ def save_wb_auth(data):
 
 
 def save_trae_auth(data):
-    uid = data.get("uid", "")
+    uid = sanitize_uid(data.get("uid", ""))
     if not uid or not data.get("access_token"):
         return False, "TraeWork 登录结果缺少 uid 或 access_token"
     doc = {
@@ -552,10 +593,37 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
                 return part[len(WEBUI_COOKIE)+1:].strip()
         return ""
 
+    def _client_ip(self):
+        """返回直连客户端 IP（ingress 由 HA 反代本地转发，来源恒为本机/容器网段）。"""
+        return self.client_address[0] if self.client_address else ""
+
+    def _is_local(self):
+        """HA ingress 转发与本机访问均为本地来源；其余视为公网直连。"""
+        ip = self._client_ip()
+        if ip in ("127.0.0.1", "::1", "localhost", ""):
+            return True
+        if ip.startswith("172.30.") or ip.startswith("172.16.") or ip.startswith("192.168.") or ip.startswith("10."):
+            return True
+        return False
+
+    def _mgmt_authorized(self):
+        """管理接口鉴权：已登录会话，或（面板未启用登录时）仅限本地来源。
+        防止 webui 凭据留空时管理接口经公网 7870 裸奔。"""
+        if _webui_check_cookie(self._cookie()):
+            return True
+        if not _webui_enabled():
+            return self._is_local()
+        return False
+
+
     def _handle_login_get(self):
         self._send(LOGIN_PAGE, "text/html; charset=utf-8")
 
     def _handle_login_post(self):
+        ip = self._client_ip()
+        if not _login_rate_ok(ip):
+            self._send_json({"error": "尝试次数过多，请 5 分钟后再试"}, 429)
+            return
         body = read_body(self) or {}
         user = (body.get("user") or "").strip()
         pw = (body.get("pass") or "").strip()
@@ -563,9 +631,23 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         want_user = (o.get("webui_user") or "").strip()
         want_pass = (o.get("webui_pass") or "").strip()
         if want_user and user == want_user and pw == want_pass:
+            _login_clear(ip)
             tok = _webui_new_session()
-            self._send_json({"ok": True, "token": tok})
+            # HttpOnly 防 XSS 窃取会话；ingress/反代场景由 HA 侧保证 HTTPS，Secure 仅在 https 请求头存在时附加
+            cookie_attrs = "%s=%s; Path=/; HttpOnly; SameSite=Lax" % (WEBUI_COOKIE, tok)
+            fwd = self.headers.get("X-Forwarded-Proto", "") or ""
+            ssl_suffix = self.headers.get("X-SSL", "")
+            if fwd == "https" or ssl_suffix or self.headers.get("Front-End-Https", "") == "on":
+                cookie_attrs += "; Secure"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Set-Cookie", cookie_attrs)
+            data = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         else:
+            _login_record_fail(ip)
             self._send_json({"error": "用户名或密码错误"}, 401)
 
     def _handle_qr(self):
@@ -729,16 +811,30 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "模型接口不可用: %s" % e}, 502)
 
     def _handle_config_get(self):
-        self._send_json({"options": load_options(), "config_file": CONFIG_FILE})
+        o = load_options()
+        # api_key 脱敏：只回显前 4 位供确认，完整值仅在设置页修改时写入
+        key = o.get("api_key") or ""
+        shown = (key[:4] + "…") if key else ""
+        o = dict(o)
+        o["api_key"] = shown
+        o["api_key_set"] = bool(key)
+        o.pop("webui_pass", None)
+        self._send_json({"options": o, "config_file": CONFIG_FILE})
 
     def _handle_logout(self):
-        """退出登录：作废当前会话 token 并提示浏览器清除 cookie。"""
+        """退出登录：作废当前会话 token，并由后端下发过期 cookie（HttpOnly 需后端清除）。"""
         try:
             if os.path.exists(SESSION_FILE):
                 os.remove(SESSION_FILE)
         except Exception:
             pass
-        self._send_json({"success": True, "message": "已退出登录", "clear_cookie": WEBUI_COOKIE})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", "%s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" % WEBUI_COOKIE)
+        data = json.dumps({"success": True, "message": "已退出登录"}, ensure_ascii=False).encode("utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_change_login(self):
         """修改面板登录账号/密码（需已登录会话）。"""
@@ -767,6 +863,10 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         for k in DEFAULT_OPTIONS:
             if k in incoming:
                 opts[k] = incoming[k]
+        # api_key 脱敏兼容：前端回传掩码（以 … 结尾且非完整 key）时保留原值
+        incoming_key = str(incoming.get("api_key") or "")
+        if incoming_key.endswith("…"):
+            opts["api_key"] = load_options().get("api_key", "")
         opts["checkin_times"] = normalize_checkin_times(opts["checkin_times"])
         opts["keepalive_hours"] = normalize_hours(opts["keepalive_hours"])
         try:
@@ -934,7 +1034,7 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         if err:
             self._send_json({"error": err}, 500)
             return
-        uid = data.get("uid", "")
+        uid = sanitize_uid(data.get("uid", ""))
         if not uid:
             self._send_json({"error": "Qoder 登录结果缺少 uid"}, 500)
             return
@@ -988,8 +1088,8 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._handle_login_get()
         elif match_key(path, "qr"):
             self._handle_qr()
-        elif _webui_enabled() and not _webui_check_cookie(self._cookie()) and not path.startswith(PROXY_PREFIX):
-            # 面板管理接口需登录；/v1/* API 走 api_key，不要求面板登录
+        elif not path.startswith(PROXY_PREFIX) and not self._mgmt_authorized():
+            # 面板管理接口需登录（或面板未启用登录时仅限本地来源）；/v1/* API 走 api_key，不要求面板登录
             self._send_json({"error": "未登录，请先访问面板首页登录"}, 401)
         elif match_key(path, "overview"):
             self._handle_overview()
@@ -1024,6 +1124,11 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         path = self._clean_path(urllib.parse.urlparse(self.path).path)
         if match_key(path, "login"):
             self._handle_login_post()
+        elif path.startswith(PROXY_PREFIX):
+            # /v1/* API 走 api_key 鉴权（serverd 内校验），不要求面板登录
+            self._proxy("POST")
+        elif not self._mgmt_authorized():
+            self._send_json({"error": "未登录，请先访问面板首页登录"}, 401)
         elif match_key(path, "logout"):
             self._handle_logout()
         elif match_key(path, "change-login"):
@@ -1056,8 +1161,10 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._handle_delete()
         elif match_key(path, "unlock"):
             self._handle_action("unlock")
-        elif path.startswith(PROXY_PREFIX):
-            self._proxy("POST")
+        elif match_key(path, "disable"):
+            self._handle_action("disable")
+        elif match_key(path, "enable"):
+            self._handle_action("enable")
         else:
             self._send("404 Not Found", "text/plain", 404)
 
@@ -1091,7 +1198,7 @@ button:hover{background:#3395ff}
 document.getElementById('lf').addEventListener('submit',async function(ev){ev.preventDefault();
 var u=document.getElementById('lu').value,p=document.getElementById('lp').value,err=document.getElementById('lerr');err.textContent='';
 try{var r=await fetch('wb-api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,pass:p})});
-var d=await r.json();if(d.ok){document.cookie='ai_proxy_session='+d.token+';path=/';location.reload();}else{err.textContent=d.error||'登录失败';}}
+var d=await r.json();if(d.ok){location.reload();}else{err.textContent=d.error||'登录失败';}}
 catch(e){err.textContent='网络错误: '+e.message;}});
 </script>
 </body></html>"""
@@ -1183,7 +1290,6 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
 <button class="tab active" data-p="overview" onclick="switchPanel('overview')">概览</button>
 <button class="tab" data-p="accounts" onclick="switchPanel('accounts')">账号</button>
 <button class="tab" data-p="models" onclick="switchPanel('models')">模型</button>
-<button class="tab" data-p="fees" onclick="switchPanel('fees')">费率</button>
 <button class="tab" data-p="settings" onclick="switchPanel('settings')">设置</button>
 </nav>
 <div class="toast" id="toastBox"></div>
@@ -1238,10 +1344,14 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
 </section>
 
 <section class="panel" id="panel-models">
- <div class="tbar"><div class="grp"><button class="btn btn-pri" onclick="loadModels()">刷新模型</button></div>
+ <div class="tbar"><div class="grp">
+  <button class="btn btn-pri" onclick="loadModels()">刷新模型</button>
+  <button class="btn btn-info" id="btnRefreshFees" onclick="refreshFees()">刷新费率</button>
+  <button class="btn btn-warn" onclick="saveAutoWhitelist()">保存 cheapest 白名单</button>
+ </div>
  <span class="hint" id="modelInfo"></span></div>
  <div class="box">
-  <p class="hint" style="margin:0 0 8px">模型带来源前缀：<code>workbuddy/&lt;model&gt;</code>、<code>traework/&lt;model&gt;</code> 或 <code>qoder/&lt;model&gt;</code>。客户端调用时必须带前缀。</p>
+  <p class="hint" style="margin:0 0 8px">模型带来源前缀：<code>workbuddy/&lt;model&gt;</code>、<code>traework/&lt;model&gt;</code> 或 <code>qoder/&lt;model&gt;</code>。客户端调用时必须带前缀。勾选「cheapest」列的模型将进入对应渠道的候选白名单（请求 <code>&lt;平台&gt;/cheapest</code> 时从中选费率最低者；<code>&lt;平台&gt;/auto</code> 直通上游原生智能路由）；全部不勾 = 不限制（0 费率模型始终不参与 cheapest）。</p>
   <div class="tbar" style="margin-bottom:10px">
    <div class="grp">
     <button class="btn sm btn-pri" data-mf="all" onclick="setModelFilter('all',this)">全部</button>
@@ -1253,16 +1363,6 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
   </div>
   <div id="modelGroups"></div>
   <div class="empty" id="modelEmpty" style="display:none">未加载到模型列表。</div>
- </div>
-</section>
-
-<section class="panel" id="panel-fees">
- <div class="tbar">
-  <div class="grp"><button class="btn btn-pri" id="btnRefreshFees" onclick="refreshFees()">刷新费率</button></div>
-  <span class="hint" id="feesInfo"></span>
- </div>
- <div class="box" id="feesBox">
-  <p class="hint" style="margin:0">加载中…</p>
  </div>
 </section>
 
@@ -1281,11 +1381,8 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
     <div class="field"><label>连续错误冷却时长</label><input id="f_cooldown_err_cooldown" placeholder="如 10m"></div>
     <div class="field"><label>低积分阈值（低于此值自动禁用到次日，可手工解锁；填 0 关闭）</label><input id="f_low_credit_threshold" type="number" min="0"></div>
   </div>
-  <div class="fsec"><h3>auto 模型候选白名单</h3>
-    <p class="hint" style="margin:0 0 10px">请求模型名 <code>&lt;平台&gt;/auto</code> 时，从下列白名单中选费率最低的模型；留空 = 该渠道所有计费模型均参与（0 费率模型始终不参与）。模型 ID 不带平台前缀，逗号分隔。</p>
-    <div class="field"><label>WorkBuddy 候选模型</label><input id="f_auto_models_workbuddy" placeholder="如 claude-sonnet-4-5,gpt-5.2（留空不限制）"></div>
-    <div class="field"><label>TraeWork 候选模型</label><input id="f_auto_models_traework" placeholder="如 doubao-seed-code（留空不限制）"></div>
-    <div class="field"><label>Qoder 候选模型</label><input id="f_auto_models_qoder" placeholder="留空不限制"></div>
+  <div class="fsec"><h3>cheapest 模型候选白名单</h3>
+    <p class="hint" style="margin:0">请到「模型」页勾选各渠道参与 cheapest（费率最低优先）的候选模型，勾选后点「保存 cheapest 白名单」。全部不勾 = 不限制（0 费率模型始终不参与）。</p>
   </div>
   <div class="fsec"><h3>面板登录账号</h3>
     <div class="field"><label>登录名</label><input id="f_webui_user" placeholder="面板登录账号"></div>
@@ -1294,7 +1391,7 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
     <p class="hint" style="margin:8px 0 0">修改后立即生效；当前会话保持，下次登录用新账号。</p>
   </div>
   <div class="fsec"><h3>定时任务</h3>
-    <div class="field"><label>每日签到时刻（HH:MM，逗号分隔，两个平台共用）</label><input id="f_checkin_times" placeholder="如 09:00,21:00"></div>
+    <div class="field"><label>每日签到时刻（HH:MM，逗号分隔，两个平台共用）</label><input id="f_checkin_times" placeholder="如 00:00,09:00,21:00"></div>
     <div class="field"><label>Token 保活时刻（整点小时，逗号分隔）</label><input id="f_keepalive_hours" placeholder="如 22"></div>
   </div>
   <div class="tbar"><button class="btn btn-ok" onclick="saveSettings()">保存设置</button>
@@ -1310,8 +1407,6 @@ function esc(s){s=(s===null||s===undefined)?'':String(s);return s.replace(/[&<>"
 function copyTxt(el){if(!el)return;const t=(el.getAttribute('data-copy')||el.textContent||'').trim();if(!t)return;navigator.clipboard&&navigator.clipboard.writeText(t).then(()=>toast('已复制到剪贴板','ok')).catch(()=>toast('复制失败','err'));}
 function toggleKey(btn){const inp=document.getElementById('f_api_key');if(!inp)return;const show=inp.type==='password';inp.type=show?'text':'password';btn.textContent=show?'隐藏':'显示';}
 async function loadFees(){
-  const box=document.getElementById('feesBox');
-  if(!box) return;
   const d=await api('fees');
   renderFees(d);
 }
@@ -1329,31 +1424,18 @@ async function refreshFees(){
 }
 
 function renderFees(fees){
-  const box=document.getElementById('feesBox');
-  if(!box) return;
   const channels=(fees&&fees.channels)||[];
   let html='';
   if(fees&&fees.note) html+='<p class="hint" style="margin:0 0 6px">'+esc(fees.note)+'</p>';
   if(fees&&fees.cached_at) html+='<p class="hint" style="margin:0 0 6px">上次更新：'+esc(fees.cached_at)+'</p>';
   if(fees&&fees.error) html+='<p class="hint" style="margin:0 0 6px;color:var(--err)">'+esc(fees.error)+'</p>';
   if(channels.length===0){
-    html+='<p class="hint" style="margin:0">'+esc((fees&&fees.disclaimer)||'')+'</p>';
-    box.innerHTML=html; return;
+    html+='<p class="hint" style="margin:0">'+esc((fees&&fees.disclaimer)||'费率数据不可用')+'</p>';
+    const groups=document.getElementById('modelGroups');
+    if(groups) groups.innerHTML=html;
+    return;
   }
-  html+='<table><thead><tr><th>模型</th><th>倍率</th><th>模型</th><th>倍率</th></tr></thead><tbody>';
-  for(const ch of channels){
-    const chName = ch.channel==='traework'?'TraeWork':(ch.channel==='qoder'?'Qoder':'WorkBuddy');
-    html+='<tr><td colspan="4" style="color:var(--sub);font-weight:600">'+esc(chName)+'</td></tr>';
-    const models=ch.models||[];
-    for(let i=0;i<models.length;i+=2){
-      const m1=models[i], m2=models[i+1];
-      html+='<tr><td><code>'+esc(m1.model)+'</code></td><td>'+fmtRate(m1)+'</td>';
-      html+='<td>'+((m2&&m2.model)?'<code>'+esc(m2.model)+'</code>':'')+'</td><td>'+((m2&&m2.model)?fmtRate(m2):'')+'</td></tr>';
-    }
-  }
-  html+='</tbody></table>';
-  if(fees&&fees.disclaimer) html+='<p class="hint" style="margin:8px 0 0">'+esc(fees.disclaimer)+'</p>';
-  box.innerHTML=html;
+  renderModels();
 }
 
 function fmtRate(m){
@@ -1364,7 +1446,7 @@ function fmtRate(m){
   return s;
 }
 
-function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='fees')loadFees();if(n==='settings')loadSettings();}
+function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='settings')loadSettings();}
 function refreshAll(){loadOverview(true);loadAccounts();}
 function fmtT(v){if(!v)return '—';const t=new Date(v*1000);if(isNaN(t))return String(v);return t.toLocaleString('zh-CN',{hour12:false});}
 function stateBadge(a){if(a.disabled)return '<span class="badge b-bad">已禁用</span>';if(a.low_credit)return '<span class="badge b-warn">低积分</span><div class="hint">仅限 0 费率模型</div>';if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');return '<span class="badge b-ok">可用</span>';}
@@ -1389,7 +1471,7 @@ const apiUrl=isIngress?(location.origin+'/'+esc(d.slug||'')+'/v1'):((location.or
 const kb=document.getElementById('ovConnInfo');
 if(kb){kb.innerHTML=(isIngress?('<div class="hint" style="margin:0 0 8px;color:var(--warn)">⚠ 当前经 HA 侧边栏（ingress）访问：ingress 地址仅供面板浏览，API 客户端请用下方 Base URL（经反代直连 addon，靠 API Key 鉴权）。</div>'):'')
 +'<div class="connrow"><code>Base URL</code><span class="cpy" onclick="copyTxt(this)">'+esc(apiUrl)+'</span></div>'
-+'<div class="connrow"><code>API Key</code><span class="cpy'+(d.api_key_set?'':' warn')+'" onclick="copyTxt(this)">'+(d.api_key_set?'（见「设置」页或 HA 加载项配置；调用时需带 Bearer）':'未设置，请先到「设置」页填写或留空则不鉴权')+'</span></div>'
++'<div class="connrow"><code>API Key</code><span class="cpy" data-copy="'+esc(d.api_key||'')+'" onclick="copyTxt(this)">'+(d.api_key_set?esc(d.api_key||'（未获取到，见「设置」页）'):'未设置，请先到「设置」页填写或留空则不鉴权')+'</span>'+(d.api_key_set?'<button class="btn sm btn-info" onclick="copyTxt(this.previousElementSibling)">复制</button>':'')+'</div>'
 +'<div class="connrow"><code>示例</code><span>'+esc('curl '+apiUrl+'/chat/completions -H "Authorization: Bearer <API_KEY>" -d \'{"model":"workbuddy/glm-5.2","messages":[{"role":"user","content":"hi"}]}\'')+'</span></div>'
 +'<div class="hint" style="margin-top:6px">客户端（OpenAI 兼容）填 Base URL 时加 <code>/v1</code>，模型名必须带来源前缀：<code>workbuddy/</code>、<code>traework/</code> 或 <code>qoder/</code>。</div>';}
 scheduleOv(!force);}
@@ -1401,12 +1483,13 @@ const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hin
 (isQ(a)?'':('<button class="btn sm btn-ok" onclick="acctAction(&#39;checkin&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">签到</button>'))+
 '<button class="btn sm btn-pri" onclick="acctAction(&#39;credits&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新积分</button>'+
 '<button class="btn sm btn-info" onclick="acctAction(&#39;refresh&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新Token</button>'+
-((a.low_credit&&!a.disabled)?('<button class="btn sm btn-warn" title="解除低积分限制，立即恢复为普通账号" onclick="acctAction(&#39;unlock&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">解锁</button>'):'')+
+((!a.disabled&&(a.low_credit||a.cooling))?('<button class="btn sm btn-warn" title="解除低积分限制或冷却，立即恢复参与轮转" onclick="acctAction(&#39;unlock&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">'+(a.low_credit?'解锁':'解禁')+'</button>'):'')+
+(a.disabled?('<button class="btn sm btn-ok" title="重新启用该账号，参与轮转" onclick="acctAction(&#39;enable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">启用</button>'):('<button class="btn sm btn-warn" title="手工禁用该账号，暂停参与轮转（可再启用）" onclick="acctAction(&#39;disable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">禁用</button>'))+
 '<button class="btn sm btn-danger" onclick="delAcct(&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">删除</button></div></td></tr>';
 wbB.innerHTML=wb.map(row).join('');trB.innerHTML=tr.map(row).join('');qdB.innerHTML=qd.map(row).join('');
 empty.style.display=(wb.length+tr.length+qd.length)?'none':'block';
 cnt.textContent='账号：WorkBuddy '+wb.length+' / TraeWork '+tr.length+' / Qoder '+qd.length+' 个';}
-async function acctAction(action,kind,uid){toast('正在执行…','info');const d=await api(action,{method:'POST',body:{platform:kind,uid:uid}});showBatch(d);setTimeout(loadAccounts,1200);}
+async function acctAction(action,kind,uid){if(action==='disable'&&!confirm('确认禁用该账号？禁用后暂停参与轮转，可随时点「启用」恢复。'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{platform:kind,uid:uid}});showBatch(d);setTimeout(loadAccounts,1200);}
 async function runAll(action,uid){if(!confirm('确定要对所有账号执行吗？'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{uid:''}});showBatch(d);setTimeout(loadAccounts,1300);}
 function showBatch(d){if(d.error){toast(d.error,'err');return;}const rs=d.results||[];if(!rs.length){toast(d.message||'完成','ok');return;}rs.forEach(r=>toast((r.ok?'✓ ':'✗ ')+'['+(r.kind||'')+'] '+r.uid+'：'+r.msg,r.ok?'ok':'err'));}
 function copyAcctValue(el,val){if(!el||val===undefined||val===null)return;navigator.clipboard&&navigator.clipboard.writeText(String(val)).then(()=>toast('已复制','ok')).catch(()=>toast('复制失败','err'));}
@@ -1467,8 +1550,29 @@ function showBoxQR(url,note){document.getElementById('loginShow').innerHTML='<di
 function showBoxLink(url,note){document.getElementById('loginShow').innerHTML='<div class="hint">'+note+'</div><p><a href="'+esc(url)+'" target="_blank">'+esc(url)+'</a></p>';}
 function addBtn(label,fn){document.getElementById('loginShow').innerHTML+='<button class="btn btn-ok" id="loginDoneBtn" style="margin-top:8px">'+label+'</button>';document.getElementById('loginDoneBtn').onclick=fn;}
 let _models=[],_modelFilter='all',_rates={},_defRates={};
+let _autoWl={workbuddy:[],traework:[],qoder:[]};   // auto 候选白名单（按渠道）
+function parseWl(s){return (s||'').split(',').map(x=>x.trim()).filter(Boolean);}
+async function loadAutoWhitelist(){const d=await api('config');if(d.error||!d.options)return;const o=d.options;_autoWl={workbuddy:parseWl(o.auto_models_workbuddy),traework:parseWl(o.auto_models_traework),qoder:parseWl(o.auto_models_qoder)};}
+function toggleWl(cb){
+ const ch=cb.dataset.auto, m=cb.dataset.model;
+ const list=_autoWl[ch]||(_autoWl[ch]=[]);
+ const i=list.indexOf(m);
+ if(cb.checked&&i<0)list.push(m);
+ if(!cb.checked&&i>=0)list.splice(i,1);
+ scheduleAutoWlSave();
+}
+let _wlSaveTimer=null;
+function scheduleAutoWlSave(){if(_wlSaveTimer)clearTimeout(_wlSaveTimer);_wlSaveTimer=setTimeout(saveAutoWhitelist,1000);}
+async function saveAutoWhitelist(){
+ if(_wlSaveTimer){clearTimeout(_wlSaveTimer);_wlSaveTimer=null;}
+ const opt={};
+ for(const ch of ['workbuddy','traework','qoder']){opt['auto_models_'+ch]=(_autoWl[ch]||[]).join(',');}
+ const d=await api('config',{method:'POST',body:{options:opt}});
+ if(d.error){toast(d.error,'err');return;}
+ toast('cheapest 白名单已自动保存，serverd 重启生效','ok');
+}
 async function loadModels(){const info=document.getElementById('modelInfo');info.textContent='加载中…';
-const [dm,df]=await Promise.all([api('models'),api('fees')]);
+const [dm,df]=await Promise.all([api('models'),api('fees'),loadAutoWhitelist()]);
 const empty=document.getElementById('modelEmpty');
 if(dm.error){info.textContent='模型接口不可用: '+esc(dm.error);_models=[];_rates={};renderModels();empty.style.display='none';return;}
 _models=dm.data||[];buildRates(df);info.textContent='共 '+_models.length+' 个模型'+(df.error?('（费率未加载: '+esc(df.error)+'）'):'');renderModels();}
@@ -1494,16 +1598,21 @@ empty.style.display=_models.length?'none':'block';
 const by={};list.forEach(m=>{const k=(m.owned_by||m.owner||'other');(by[k]=by[k]||[]).push(m);});
 const names={workbuddy:'WorkBuddy',traework:'TraeWork',qoder:'Qoder',other:'其他'};
 let html='';
-for(const k of ['workbuddy','traework','qoder','other']){if(!by[k])continue;const ms=by[k];html+='<div class="subhead">'+esc(names[k]||k)+'（'+ms.length+'）</div><table><thead><tr><th>模型 ID</th><th>上下文(tokens)</th><th>最大输出(tokens)</th><th>费率</th></tr></thead><tbody>'+ms.map(m=>'<tr><td><code>'+esc(m.id)+'</code></td><td>'+(m.context_length||'—')+'</td><td>'+(m.max_output_tokens||'—')+'</td>'+rateCell(m)+'</tr>').join('')+'</tbody></table>';}
+for(const k of ['workbuddy','traework','qoder','other']){if(!by[k])continue;const ms=by[k];
+html+='<div class="subhead">'+esc(names[k]||k)+'（'+ms.length+'）</div><table><thead><tr><th title="勾选后加入 cheapest 候选白名单">cheapest</th><th>模型 ID</th><th>上下文(tokens)</th><th>最大输出(tokens)</th><th>费率</th></tr></thead><tbody>'
++ms.map(m=>{const bare=(m.id||'').split('/').pop();const ck=(_autoWl[k]||[]).includes(bare)?' checked':'';
+return '<tr><td>'+(k==='other'?'':'<label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" data-auto="'+k+'" data-model="'+esc(bare)+'"'+ck+' onchange="toggleWl(this)"></label>')+'</td>'
++'<td><code>'+esc(m.id)+'</code></td><td>'+(m.context_length||'—')+'</td><td>'+(m.max_output_tokens||'—')+'</td>'+rateCell(m)+'</tr>';}).join('')+'</tbody></table>';}
 if(!html)html='<p class="hint" style="text-align:center;padding:12px">没有匹配的模型。</p>';
 groups.innerHTML=html;}
+
 async function loadSettings(){const d=await api('config');if(d.error){toast(d.error,'err');return;}const o=d.options||{};const set=(id,v)=>document.getElementById(id).value=(v===undefined||v===null)?'':v;
-set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_low_credit_threshold',o.low_credit_threshold);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);set('f_auto_models_workbuddy',o.auto_models_workbuddy||'');set('f_auto_models_traework',o.auto_models_traework||'');set('f_auto_models_qoder',o.auto_models_qoder||'');}
-async function doLogout(){const d=await api('logout',{method:'POST'});if(d.clear_cookie){document.cookie=d.clear_cookie+'=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT';}location.reload();}
+set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_low_credit_threshold',o.low_credit_threshold);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
+async function doLogout(){await api('logout',{method:'POST'});location.reload();}
 function showLoginUser(){var u=document.getElementById('loginUser');if(u){u.textContent='已登录: admin';u.style.display='inline-block';}var b=document.getElementById('btnLogout');if(b)b.style.display='inline-block';}
 async function changeLogin(){const u=(document.getElementById('f_webui_user')||{}).value||'';const p=(document.getElementById('f_webui_pass')||{}).value||'';if(!u){toast('请填写登录名','err');return;}const d=await api('change-login',{method:'POST',body:{user:u,pass:p}});toast(d.message||d.error,d.success?'ok':'err');if(d.success){document.getElementById('f_webui_user').value='';document.getElementById('f_webui_pass').value='';}}
 async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
-opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');opt.auto_models_workbuddy=get('f_auto_models_workbuddy');opt.auto_models_traework=get('f_auto_models_traework');opt.auto_models_qoder=get('f_auto_models_qoder');
+opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
 loadOverview(true);showLoginUser();</script></body></html>"""
 

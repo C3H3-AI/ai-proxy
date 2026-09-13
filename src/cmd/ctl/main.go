@@ -31,7 +31,7 @@ func main() {
 	log.SetOutput(os.Stderr) // 进度日志走 stderr，不污染 stdout JSON
 
 	cfgPath := flag.String("config", "config.json", "path to config json")
-	mode := flag.String("mode", "accounts", "accounts|credits|checkin|refresh|unlock")
+	mode := flag.String("mode", "accounts", "accounts|credits|checkin|refresh|unlock|disable|enable")
 	p := flag.String("p", "", "platform: workbuddy|traework (empty=both)")
 	uid := flag.String("uid", "", "account uid (empty=all)")
 	flag.Parse()
@@ -63,6 +63,10 @@ func main() {
 		out = collectRefresh(r, wantKind(*p), *uid)
 	case "unlock":
 		out = collectUnlock(r, wantKind(*p), *uid)
+	case "disable":
+		out = collectSetEnabled(r, wantKind(*p), *uid, false)
+	case "enable":
+		out = collectSetEnabled(r, wantKind(*p), *uid, true)
 	default:
 		fatalf("unknown mode %q", *mode)
 	}
@@ -120,6 +124,42 @@ func collectUnlock(r *svc.Runtime, ks []provider.Kind, uid string) []outUnlock {
 			pl.Unlock(st.UID)
 			o.OK = true
 			o.Msg = "已解锁"
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// collectSetEnabled 手工禁用/启用账号（面板账号管理操作）。
+func collectSetEnabled(r *svc.Runtime, ks []provider.Kind, uid string, enabled bool) []outUnlock {
+	var out []outUnlock
+	verb := "已启用"
+	if !enabled {
+		verb = "已禁用"
+	}
+	for _, k := range kinds {
+		if !matchKind(ks, k) {
+			continue
+		}
+		pl := r.Pool(k)
+		for _, st := range pl.List() {
+			if uid != "" && st.UID != uid {
+				continue
+			}
+			o := outUnlock{Kind: k.String(), UID: st.UID, Nickname: st.Nickname, Credits: st.Credits}
+			if !enabled && st.Disabled {
+				o.Msg = "账号已是禁用状态"
+				out = append(out, o)
+				continue
+			}
+			if enabled && !st.Disabled {
+				o.Msg = "账号未在禁用状态，无需启用"
+				out = append(out, o)
+				continue
+			}
+			pl.SetEnabled(st.UID, enabled)
+			o.OK = true
+			o.Msg = verb
 			out = append(out, o)
 		}
 	}
