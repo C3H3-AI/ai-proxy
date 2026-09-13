@@ -1,0 +1,5 @@
+.mimosa/
+trae-tokens-local/
+deploy_commit.sh
+commit_restore.sh
+rebuild_commit.sh
