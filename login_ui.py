@@ -597,23 +597,48 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         """返回直连客户端 IP（ingress 由 HA 反代本地转发，来源恒为本机/容器网段）。"""
         return self.client_address[0] if self.client_address else ""
 
-    def _is_local(self):
-        """HA ingress 转发与本机访问均为本地来源；其余视为公网直连。"""
+    def _is_loopback(self):
+        """仅本机回环（ingress 反代与容器内自调用）。"""
         ip = self._client_ip()
-        if ip in ("127.0.0.1", "::1", "localhost", ""):
+        return ip in ("127.0.0.1", "::1", "localhost", "")
+
+    def _is_private(self):
+        """容器/内网网段（含 HA 的 172.30.x 与常见 LAN 段）。"""
+        ip = self._client_ip()
+        if self._is_loopback():
             return True
-        if ip.startswith("172.30.") or ip.startswith("172.16.") or ip.startswith("192.168.") or ip.startswith("10."):
-            return True
-        return False
+        return (ip.startswith("172.30.") or ip.startswith("172.16.")
+                or ip.startswith("192.168.") or ip.startswith("10."))
+
+    def _is_ingress(self):
+        """是否为 HA ingress 转发请求。
+
+        ingress 会把请求转发到 127.0.0.1 并在路径上保留
+        /api/hassio_ingress/<token>/ 前缀（与第 1081 行的同款判断一致）。
+        """
+        path = self.path or ""
+        return path.startswith("/api/hassio_ingress/") or "/hassio_ingress/" in path
 
     def _mgmt_authorized(self):
-        """管理接口鉴权：已登录会话，或（面板未启用登录时）仅限本地来源。
-        防止 webui 凭据留空时管理接口经公网 7870 裸奔。"""
+        """管理接口鉴权（按可信度从高到低）。
+
+        1. 有有效登录会话 → 放行；
+        2. 面板**未启用**登录时：
+           - ingress 转发（HA 已做认证）→ 放行；
+           - 本机回环 → 放行；
+           - **其它内网来源（LAN 直连）→ 拒绝**。
+
+        第 2 条的 LAN 分支是安全修复：此前把所有内网段一并放行，
+        而 config.yaml 默认 webui 凭据为空、且 7870 端口映射到宿主机，
+        导致同网段任意设备可无认证调用管理接口
+        （含账号列表、刷新令牌、修改配置）。
+        """
         if _webui_check_cookie(self._cookie()):
             return True
-        if not _webui_enabled():
-            return self._is_local()
-        return False
+        if _webui_enabled():
+            return False
+        # 未启用登录：只信任 ingress 与本机，不再信任整个内网
+        return self._is_ingress() or self._is_loopback()
 
 
     def _handle_login_get(self):
