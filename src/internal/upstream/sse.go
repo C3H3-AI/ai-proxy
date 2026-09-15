@@ -5,9 +5,11 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -193,14 +195,37 @@ func sortInts(a []int) {
 
 // Stream 透传上游 SSE 到 w（每行 flush），保证至少写一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
+//
+// 关于「200 里带错误」：上游并非只在 status>=400 时报错。
+// 同包的 doJSONWith / FetchModels / FetchModelPricing 三处都显式处理了
+// `code != 0` 的 200 响应（见 client.go:179 / 309 / 544），说明这是真实形态。
+// 而流式路径此前只做逐行透传，若上游以 200 返回
+//   {"code":1,"msg":"余额不足"}
+// 这类**非 SSE 单行 JSON**，会被原样写给客户端：
+//   - OpenAI SDK 收到非 `data: ` 前缀内容 → 解析失败或静默忽略；
+//   - 且该账号不会被 Classify 判定 → 不冷却 → 后续请求继续选中它。
+//
+// 因此这里在透传前对**首个有效行**做嗅探：若它不是 SSE 帧（`data: ` / `event:` /
+// 注释 `:` / 空行），则尝试按上游错误信封解析；判定为错误时返回 *Error，
+// 由调用方走既有的错误分类与冷却逻辑。
 func Stream(w http.ResponseWriter, r io.Reader) error {
+	br := bufio.NewReaderSize(r, 64*1024)
+
+	// ── 首帧嗅探 ──────────────────────────────────────────────
+	// 只 peeking 第一行，不影响后续透传（peek 不消费）。
+	if first, err := peekFirstNonEmptyLine(br); err == nil && first != "" {
+		if kind, msg, isErr := classifyNonSSELine(first); isErr {
+			log.Printf("chat_stream: upstream returned non-SSE error in 200 body: %s", truncate(msg, 200))
+			return &Error{Kind: kind, Status: http.StatusOK, Msg: truncate(msg, 200)}
+		}
+	}
+
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
-	br := bufio.NewReaderSize(r, 64*1024)
 	sawDone := false
 	for {
 		line, err := br.ReadString('\n')
@@ -231,4 +256,74 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		}
 	}
 	return nil
+}
+
+// peekFirstNonEmptyLine 返回首个非空行的内容（**不消费**缓冲）。
+//
+// 用 Peek 而非 ReadString：嗅探失败时不能吃掉首行，否则正常流会丢帧。
+//
+// 实现要点：反复 Peek 整个已缓冲内容，扫描其中的首个非空行；
+// 缓冲不足时用 Peek(n) 主动触发底层读取（n 单调递增，保证终止）。
+func peekFirstNonEmptyLine(br *bufio.Reader) (string, error) {
+	for n := 1; n <= 64*1024; {
+		buf, err := br.Peek(n)
+		// 在已缓冲数据中按行扫描，返回第一个非空行
+		for rest := buf; ; {
+			idx := bytes.IndexByte(rest, '\n')
+			if idx < 0 {
+				break // 这一行还没读全，扩大窗口
+			}
+			if line := strings.TrimSpace(string(rest[:idx])); line != "" {
+				return line, nil
+			}
+			rest = rest[idx+1:] // 空行，继续看下一行
+		}
+		// 已缓冲部分全是空行且无换行结尾：若没有更多数据可读，返回空
+		if err != nil {
+			if len(buf) == 0 {
+				return "", err
+			}
+			// 有内容但无换行（流结束），当作最后一行
+			return strings.TrimSpace(string(buf)), nil
+		}
+		if n < len(buf) {
+			n = len(buf) // 已缓冲多于请求量，直接对齐
+		}
+		n *= 2
+	}
+	return "", nil
+}
+
+// classifyNonSSELine 判断一行内容是否为「非 SSE 的错误载荷」。
+//
+// 返回 (错误类别, 原始文本, 是否确认为错误)。
+// 合法的 SSE 行（`data: ` / `event: ` / `id: ` / `retry: ` / 注释 `:` / 空行）
+// 一律返回 false，保证正常流不受影响。
+func classifyNonSSELine(line string) (ErrKind, string, bool) {
+	t := strings.TrimSpace(line)
+	if t == "" {
+		return ErrNone, "", false
+	}
+	// 合法 SSE 字段前缀
+	for _, p := range []string{"data:", "event:", "id:", "retry:", ":"} {
+		if strings.HasPrefix(t, p) {
+			return ErrNone, "", false
+		}
+	}
+	// 非 SSE 行：尝试按上游错误信封解析
+	var env apiEnvelope
+	if err := json.Unmarshal([]byte(t), &env); err == nil {
+		// code != 0 视为业务错误；走与 doJSONWith 相同的分类口径
+		if env.Code != 0 {
+			kind := Classify(http.StatusOK, env.Msg)
+			if kind == ErrNone {
+				kind = ErrClient
+			}
+			return kind, fmt.Sprintf("code=%d msg=%s", env.Code, env.Msg), true
+		}
+		// code == 0 但仍非 SSE：形态异常
+		return ErrClient, truncate(t, 200), true
+	}
+	// 非 JSON 且非 SSE —— 不是合法的 SSE 流内容
+	return ErrClient, truncate(t, 200), true
 }

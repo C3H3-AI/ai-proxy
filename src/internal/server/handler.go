@@ -483,35 +483,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if status >= 400 {
 			kind := rt.Upstream.Classify(status, string(respBody))
-			switch kind {
-			case provider.ErrHardCredit:
-				// 依据账号实际状态，而非模型费率，判断是否属于「免费额度已用完」：
-				// 低积分账号即使调用 0 费率模型仍报余额不足 → 禁用到次日自动恢复。
-				if st, ok := rt.Pool.Status(acct.UID); ok && st.LowCredit {
-					now := time.Now()
-					until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
-					rt.Pool.Cooldown(acct.UID, pool.CoolHard, until.Sub(now), "免费额度已用完，次日恢复")
-				} else {
-					rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
-				}
-			case provider.ErrSoftRate:
-				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
-			case provider.ErrSessionDead:
-				rt.Pool.Disable(acct.UID, "session dead")
-			case provider.ErrNotFound:
-				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
-			default:
-				rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-			}
+			h.applyUpstreamError(rt, acct.UID, kind)
 			h.stickyClear(rt)
 			lastErr = &provider.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			continue
 		}
 		defer rc.Close()
-		rt.Pool.NoteSuccess(acct.UID)
-		h.stickySuccess(rt)
 		if peek.Stream {
-			_ = rt.Upstream.Stream(w, rc)
+			// 流式：先透传，成功后才记成功。
+			// 注意 Stream 可能在【写成 HTTP 200 之后】才失败（见下），
+			// 因此这里不能先 NoteSuccess —— 否则账号已被标记健康，
+			// 而实际这次请求是失败的（H3/M2）。
+			if serr := rt.Upstream.Stream(w, rc); serr != nil {
+				// 上游在 200 body 里返回了非 SSE 错误（Stream 负责嗅探并判定），
+				// 或流中途断开。此时响应头可能已发出，无法再回写错误码，
+				// 但**必须**把错误反映到账号状态，否则后续请求会继续选中它。
+				if ue, ok := serr.(*provider.Error); ok {
+					log.Printf("stream error platform=%s uid=%s kind=%s msg=%s",
+						rt.Kind, acct.UID, ue.Kind, ue.Msg)
+					h.applyUpstreamError(rt, acct.UID, ue.Kind)
+				} else {
+					log.Printf("stream i/o error platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
+				}
+				h.stickyClear(rt)
+				return
+			}
+			rt.Pool.NoteSuccess(acct.UID)
+			h.stickySuccess(rt)
 			return
 		}
 		resp, err := rt.Upstream.Aggregate(rc)
@@ -519,6 +517,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
 		}
+		rt.Pool.NoteSuccess(acct.UID)
+		h.stickySuccess(rt)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -527,6 +527,38 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		msg += ": " + lastErr.Error()
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+}
+
+// applyUpstreamError 按错误类别更新账号池状态（冷却/禁用/计数）。
+//
+// 从 chatCompletions 的错误分支中抽出，供两条路径共用：
+//   - 非 2xx 响应（走 Classify）
+//   - 流式透传中途发现的上游错误（Stream 嗅探出 *provider.Error，H3）
+//
+// 后者此前会被完全忽略（`_ = Stream(...)`），导致：
+//   1. 账号仍被标记为健康（NoteSuccess 在 Stream 之前调用）；
+//   2. 后续请求继续选中这个实际不可用的账号。
+func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrKind) {
+	switch kind {
+	case provider.ErrHardCredit:
+		// 依据账号实际状态，而非模型费率，判断是否属于「免费额度已用完」：
+		// 低积分账号即使调用 0 费率模型仍报余额不足 → 禁用到次日自动恢复。
+		if st, ok := rt.Pool.Status(uid); ok && st.LowCredit {
+			now := time.Now()
+			until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+			rt.Pool.Cooldown(uid, pool.CoolHard, until.Sub(now), "免费额度已用完，次日恢复")
+		} else {
+			rt.Pool.Cooldown(uid, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
+		}
+	case provider.ErrSoftRate:
+		rt.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+	case provider.ErrSessionDead:
+		rt.Pool.Disable(uid, "session dead")
+	case provider.ErrNotFound:
+		rt.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+	default:
+		rt.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+	}
 }
 
 func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
