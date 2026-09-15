@@ -3,3 +3,7 @@ trae-tokens-local/
 deploy_commit.sh
 commit_restore.sh
 rebuild_commit.sh
+
+# Python 字节码（不应入库）
+__pycache__/
+*.pyc

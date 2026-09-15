@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rockswang/workbuddy-wild/internal/atomicfile"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或 CPA 面板扁平形）。
@@ -201,11 +203,11 @@ func (a *Auth) saveAtomicLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, a.FilePath)
+	// 用 atomicfile 而非 "path.tmp" 固定名：
+	// serverd 与 ctl 是两个独立进程，会写同一份凭证文件，
+	// 固定临时名会导致内容交错 / rename 竞争，甚至丢失较新的 refreshToken。
+	// 详见 internal/atomicfile 的包注释。
+	return atomicfile.WriteFile(a.FilePath, raw, 0o600)
 }
 
 // LoadDir 扫描 dir 下 workbuddy*.json，只收 wantRegion（"cn"/"global"）。

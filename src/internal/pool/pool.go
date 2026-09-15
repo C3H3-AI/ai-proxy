@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rockswang/workbuddy-wild/internal/atomicfile"
 	"github.com/rockswang/workbuddy-wild/internal/auth"
 )
 
@@ -444,9 +445,7 @@ func (p *Pool) saveLocked() {
 	if dir := filepath.Dir(p.stateFp); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, p.stateFp)
+	// 与 auth 文件同理：state 也可能被多个进程写（serverd 主进程 + 面板触发的 ctl），
+	// 固定 "state.json.tmp" 会有 rename 竞争。用 atomicfile 消除。
+	_ = atomicfile.WriteFile(p.stateFp, raw, 0o600)
 }
