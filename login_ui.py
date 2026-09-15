@@ -110,25 +110,40 @@ def _webui_enabled():
 
 
 def _webui_check_cookie(cookie_val):
-    """校验面板会话 cookie。"""
+    """校验面板会话 cookie（恒定时间比较，避免时序侧信道）。"""
     if not cookie_val:
         return False
     try:
         with open(SESSION_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip() == cookie_val.strip()
+            want = f.read().strip()
     except Exception:
         return False
+    if not want:
+        return False
+    # hmac.compare_digest 而非 ==：字符串比较会短路，
+    # 攻击者可据响应时间逐字节推断 token。
+    import hmac
+    return hmac.compare_digest(want, cookie_val.strip())
 
 
 def _webui_new_session():
-    """生成并持久化一个新会话 token。"""
-    import hashlib, time
-    tok = hashlib.sha256(("%f|%d" % (time.time(), id(SESSION_FILE))).encode()).hexdigest()
+    """生成并持久化一个新的会话 token。
+
+    用 secrets.token_urlsafe 而非 sha256(time.time())：
+    后者的熵几乎全部来自时间戳（可猜测），且 id(SESSION_FILE)
+    在同一进程内恒定，实际可被暴力枚举。
+
+    token 落盘权限 0600；写入失败时返回空串，调用方据此判定登录失败，
+    避免"生成了 token 但没存下"导致会话静默不可用。
+    """
+    import secrets
+    tok = secrets.token_urlsafe(32)
     try:
-        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        fd = os.open(SESSION_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(tok)
     except Exception:
-        pass
+        return ""
     return tok
 
 
@@ -658,6 +673,12 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         if want_user and user == want_user and pw == want_pass:
             _login_clear(ip)
             tok = _webui_new_session()
+            if not tok:
+                # token 无法落盘（磁盘满 / 权限问题）：明确失败，
+                # 而不是发一个服务器并不认识的 cookie 让用户反复重试。
+                _login_record_fail(ip)
+                self._send_json({"error": "会话创建失败，请检查容器磁盘空间与权限"}, 500)
+                return
             # HttpOnly 防 XSS 窃取会话；ingress/反代场景由 HA 侧保证 HTTPS，Secure 仅在 https 请求头存在时附加
             cookie_attrs = "%s=%s; Path=/; HttpOnly; SameSite=Lax" % (WEBUI_COOKIE, tok)
             fwd = self.headers.get("X-Forwarded-Proto", "") or ""
