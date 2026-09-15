@@ -119,3 +119,46 @@ func TestCheckinClaimRetriesRateLimit(t *testing.T) {
 		t.Fatalf("claim calls=%d", calls.Load())
 	}
 }
+
+// TestFetchModelsSkipsCustomModels 校验 is_custom_model 与 custom_model_ 前缀
+// 两种形态的自定义模型都被过滤掉：这类模型（第三方代理）调用需额外授权，
+// 出现在 /v1/models 里会让客户端选中后必然失败。
+func TestFetchModelsSkipsCustomModels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != EpModels {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"config_info_list":[
+			{"config_name":"glm-5.2","display_config":{"display_name":"GLM 5.2"}},
+			{"config_name":"kimi-k2","display_config":{"display_name":"Kimi K2","is_custom_model":true}},
+			{"config_name":"custom_model_proxy-x","display_config":{"display_name":"Proxy X"}},
+			{"config_name":"glm-5.2","display_config":{"display_name":"GLM 5.2 dup"}}
+		]}`))
+	}))
+	defer srv.Close()
+
+	c := New()
+	c.AgentHost = srv.URL
+	c.HTTP = srv.Client()
+	models, err := c.FetchModels(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	got := map[string]bool{}
+	for _, m := range models {
+		got[m.ID] = true
+	}
+	if !got["glm-5.2"] {
+		t.Errorf("normal model filtered out: %v", got)
+	}
+	if got["kimi-k2"] {
+		t.Errorf("is_custom_model=true not filtered: %v", got)
+	}
+	if got["custom_model_proxy-x"] {
+		t.Errorf("custom_model_ prefix not filtered: %v", got)
+	}
+	if len(models) != 1 {
+		t.Errorf("want 1 model (dedup + filter), got %d: %v", len(models), got)
+	}
+}

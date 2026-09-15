@@ -54,6 +54,31 @@ type Config struct {
 	AutoModels map[provider.Kind][]string
 }
 
+// defaultRefreshSkew 返回按平台的默认 token 预刷新窗口。
+//
+// TraeWork 的 access token 生命周期短且上游可能提前吊销，10 分钟窗口过窄：
+// 一旦请求途中 token 失效，上游返回 401 会被 Classify 判为 ErrSessionDead，
+// 进而 Pool.Disable 永久禁用账号（需人工重登）。traework2api 用 24h 窗口正是
+// 为此，这里与其对齐。WorkBuddy 侧 10 分钟已足够，保持不变。
+func defaultRefreshSkew(kind provider.Kind) time.Duration {
+	if kind == provider.TraeWork {
+		return 24 * time.Hour
+	}
+	return 10 * time.Minute
+}
+
+// refreshSkewFor 解析指定平台实际使用的预刷新窗口：
+// cfg.RefreshSkew 显式配置时仍以全局值为准（保持旧行为、便于统一调参），
+// 未配置（<=0）或低于平台默认值时取平台默认值——窗口只放宽不收紧，
+// 避免把 TraeWork 又调回过窄区间。
+func (h *Handler) refreshSkewFor(kind provider.Kind) time.Duration {
+	base := defaultRefreshSkew(kind)
+	if h.cfg.RefreshSkew > base {
+		return h.cfg.RefreshSkew
+	}
+	return base
+}
+
 // Handler 主路由。
 type Handler struct {
 	cfg Config
@@ -86,7 +111,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.ErrCooldown = 10 * time.Minute
 	}
 	if cfg.RefreshSkew <= 0 {
-		cfg.RefreshSkew = 10 * time.Minute
+		cfg.RefreshSkew = defaultRefreshSkew(provider.WorkBuddy)
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sticky: make(map[string]*stickyEntry)}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -430,7 +455,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[acct.UID] = true
-		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+		if acct.NeedsRefresh(h.refreshSkewFor(rt.Kind)) {
 			log.Printf("refresh start platform=%s uid=%s reason=request", rt.Kind, acct.UID)
 			if err := rt.Upstream.RefreshToken(acct); err != nil {
 				log.Printf("refresh failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)

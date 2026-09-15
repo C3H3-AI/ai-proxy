@@ -11,6 +11,7 @@ import (
 
 	"github.com/rockswang/workbuddy-wild/internal/auth"
 	"github.com/rockswang/workbuddy-wild/internal/pool"
+	"github.com/rockswang/workbuddy-wild/internal/provider"
 	"github.com/rockswang/workbuddy-wild/internal/upstream"
 )
 
@@ -230,8 +231,9 @@ func TestModelsDynamic(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	data := resp["data"].([]any)
-	if len(data) != 3 {
-		t.Fatalf("want 3 dynamic models, got %d: %v", len(data), data)
+	// 3 个动态模型 + 平台虚拟 cheapest 条目（v1.1.0b11 起在模型列表末尾追加）。
+	if len(data) != 4 {
+		t.Fatalf("want 4 models (3 dynamic + cheapest), got %d: %v", len(data), data)
 	}
 	ids := map[string]bool{}
 	for _, m := range data {
@@ -239,6 +241,9 @@ func TestModelsDynamic(t *testing.T) {
 	}
 	if !ids["workbuddy/dyn-model-a"] || !ids["workbuddy/glm-9.9"] {
 		t.Errorf("dynamic ids missing: %v", ids)
+	}
+	if !ids["workbuddy/cheapest"] {
+		t.Errorf("virtual cheapest entry missing: %v", ids)
 	}
 
 	// 断言字段映射：maxInputTokens → context_length，maxOutputTokens → max_output_tokens
@@ -426,5 +431,30 @@ func TestStatusRequiresAuth(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
 		t.Errorf("healthz: code=%d", rec.Code)
+	}
+}
+
+// TestRefreshSkewPerPlatform 校验预刷新窗口按平台区分：
+// TraeWork 必须拿到比 WorkBuddy 宽得多的窗口（24h vs 10min），否则请求途中
+// token 失效会返回 401 → ErrSessionDead → 账号被永久禁用（需人工重登）。
+func TestRefreshSkewPerPlatform(t *testing.T) {
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1"}), Upstream: newFakeUpstream(t, nil)})
+
+	if got := h.refreshSkewFor(provider.TraeWork); got != 24*time.Hour {
+		t.Errorf("traework skew=%v want 24h", got)
+	}
+	if got := h.refreshSkewFor(provider.WorkBuddy); got != 10*time.Minute {
+		t.Errorf("workbuddy skew=%v want 10m", got)
+	}
+
+	// 显式配置更大的窗口时以配置为准。
+	h2 := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1"}), Upstream: newFakeUpstream(t, nil), RefreshSkew: 48 * time.Hour})
+	if got := h2.refreshSkewFor(provider.WorkBuddy); got != 48*time.Hour {
+		t.Errorf("configured skew not honored: %v", got)
+	}
+	// 配置小于平台默认值时不得收紧（否则会把 TraeWork 调回过窄区间）。
+	h3 := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1"}), Upstream: newFakeUpstream(t, nil), RefreshSkew: time.Minute})
+	if got := h3.refreshSkewFor(provider.TraeWork); got != 24*time.Hour {
+		t.Errorf("traework skew narrowed to %v, want >=24h", got)
 	}
 }
