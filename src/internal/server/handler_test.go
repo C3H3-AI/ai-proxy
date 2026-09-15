@@ -458,3 +458,43 @@ func TestRefreshSkewPerPlatform(t *testing.T) {
 		t.Errorf("traework skew narrowed to %v, want >=24h", got)
 	}
 }
+
+// TestStreamUpstreamErrorIn200CoolsAccount —— H3 端到端回归。
+//
+// 上游可能以 HTTP 200 返回非 SSE 错误体（同包 doJSONWith/FetchModels/
+// FetchModelPricing 三处都显式处理 `code != 0`，证明这是真实形态）。
+//
+// 修复前：Stream 把该内容原样透传给客户端，且账号被标记成功，
+//        后续请求继续选中这个实际不可用的账号。
+// 修复后：Stream 嗅探出错误 → handler 按类别冷却/禁用该账号。
+func TestStreamUpstreamErrorIn200CoolsAccount(t *testing.T) {
+	// 上游对任何请求都回 200 + 非 SSE 错误体
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, `{"code":1,"msg":"余额不足"}` + "\n", true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		HardCooldown: time.Hour, SoftCooldown: time.Minute,
+		ErrThreshold: 3, ErrCooldown: 10 * time.Minute,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"workbuddy/glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// 客户端不应收到那条非 SSE 的裸 JSON
+	if strings.Contains(rec.Body.String(), `"余额不足"`) {
+		t.Errorf("非 SSE 错误体被透传给客户端: %q", rec.Body.String())
+	}
+
+	// 账号必须被冷却/禁用，而不是仍被视为健康
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("账号 u1 不在池中")
+	}
+	if !st.Cooling && !st.Disabled {
+		t.Errorf("上游报错后账号未冷却/禁用（修复前即为该症状）: %+v", st)
+	}
+}
