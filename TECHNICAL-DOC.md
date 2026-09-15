@@ -81,7 +81,7 @@
 ha-ai-proxy/
 ├── config.yaml        HA addon 清单（名称/端口/ingress/options/schema）
 ├── schema.yaml        options 字段类型定义（与 config.yaml schema 重复）
-├── build.yaml         HA addon 构建描述（aarch64/amd64，golang:1.25-alpine）
+（build.yaml 已移除：legacy builder 配置，Supervisor 2026.04.0 起不再读取）
 ├── Dockerfile         多阶段构建：golang:1.25-alpine 编译 4 个二进制 + alpine 运行时
 ├── run.sh             入口：建持久化目录 → exec python3 login_ui.py
 ├── login_ui.py        管理面板 + OpenAI API 统一入口（Python 3）
@@ -330,7 +330,7 @@ Web UI 为单文件内嵌 HTML（暗色主题），含概览/账号/模型/设�
 ## 11. 部署形态
 
 - **形态**：HA addon（Supervisor 托管）。`config.yaml` 含 `hassio_api`/`ingress`/`panel_icon` 等字段。
-- **构建**：`build.yaml` 双架构（aarch64→arm64 / amd64）；Dockerfile 多阶段：golang:1.25-alpine 编译 4 个二进制 → alpine:3.20 运行时（bash/curl/jq/python3/ca-certificates/tzdata）。
+- **构建**：GitHub Actions + HA 官方 builder actions 预构建多架构镜像推 GHCR（`ghcr.io/c3h3-ai/ai-proxy`），Supervisor 直接拉取；Dockerfile 多阶段：golang:1.25-alpine 编译 5 个二进制 → alpine:3.20 运行时（bash/curl/jq/python3/ca-certificates/tzdata）。
 - **启动**：`run.sh` → `python3 login_ui.py`（PID 1）→ 拉起 `serverd`。
 - **持久化**：`/data/auths`（凭证，rw）、`/data/data`（state.json、options.json、config.json）。
 - **健康检查**：`wget http://127.0.0.1:7863/healthz`。

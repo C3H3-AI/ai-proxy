@@ -1,0 +1,82 @@
+name: PR Validate
+
+# PR 门禁：分支来源 / 标题格式 / 正文完整性 / 变更类型唯一。
+# 移植自 hacs-vision 的 pr-validate.yml（规则已在那边跑通）。
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      # 禁止从 main/master 直接提 PR（那等于绕过 review 直接进主干）
+      - name: Validate branch
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          echo "Checking branch: $BRANCH"
+          if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+            echo "::error::Direct PR from main/master is forbidden"
+            gh pr close "$PR_NUMBER" --comment "禁止从 main/master 提交 PR / Direct PR from main/master is forbidden."
+            exit 1
+          fi
+          echo "Branch passed"
+
+      # 标题须为空则拒；含冒号时须为 <type>: <description>
+      - name: Validate PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          echo "Checking PR title"
+          if [[ -z "$PR_TITLE" ]]; then
+            echo "::error::PR title is empty"
+            exit 1
+          fi
+          if [[ "$PR_TITLE" == *:* ]]; then
+            if [[ ! "$PR_TITLE" =~ ^[^:]+:[[:space:]]*.+ ]]; then
+              echo "::error::Invalid PR title format. Expected: <type>: <description>"
+              exit 1
+            fi
+          fi
+          echo "PR title passed"
+
+      # 正文须有 Description 段，且变更类型勾选恰好一项
+      - name: Validate PR content
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        shell: bash
+        run: |
+          echo "Checking PR content"
+          if [[ -z "$PR_BODY" ]]; then
+            echo "::error::PR body is empty"
+            exit 1
+          fi
+
+          DESCRIPTION=$(echo "$PR_BODY" \
+            | sed '/<!--/,/-->/d' \
+            | awk '/^## Description/ {flag=1; next} /^## / {flag=0} flag' \
+            | sed '/^[[:space:]]*$/d')
+          if [[ -z "$DESCRIPTION" ]]; then
+            echo "::error::Description section is empty"
+            exit 1
+          fi
+          echo "Description passed"
+
+          TYPE_COUNT=$(echo "$PR_BODY" | grep -Ec '\[x\].*(bugfix|new feature|refactor|breaking|docs):')
+          if [[ "$TYPE_COUNT" -ne 1 ]]; then
+            echo "::error::Select exactly one change type (found $TYPE_COUNT)"
+            exit 1
+          fi
+          PR_TYPE=$(echo "$PR_BODY" \
+            | grep -E '\[x\].*(bugfix|new feature|refactor|breaking|docs):' \
+            | sed -E 's/.*\] ([^:]+):.*/\1/')
+          echo "Change type: $PR_TYPE"

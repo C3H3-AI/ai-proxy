@@ -1,0 +1,24 @@
+name: Sync Labels
+
+# 手动触发：把 .github/labels.yml 推送到仓库标签。
+# 新仓库首次启用时跑一次；之后改 labels.yml 再跑。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync labels
+        uses: crazy-max/ghaction-github-labeler@v5
+        with:
+          yaml-file: .github/labels.yml
+          dry-run: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

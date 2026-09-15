@@ -1,0 +1,55 @@
+name: Close Stale Issues
+
+# 自动标记长期无活动的 issue，并在持续无活动后关闭。
+# 计划：每天 UTC 01:30 运行。
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          # === 时间设置 ===
+          days-before-stale: 15
+          days-before-close: 5
+          # 只处理 issue，不处理 PR
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+
+          # === 豁免标签 ===
+          # bug 类问题不自动关闭（可能是真问题，只是没人跟）
+          exempt-issue-labels: "bug,🐛 Bug Fix"
+
+          # === 要添加的标签 ===
+          stale-issue-label: stale
+          close-issue-label: stale-closed
+
+          # === 消息（双语）===
+          stale-issue-message: >-
+            This issue has been inactive for 15 days and is being marked as stale.
+            该问题已 15 天无活动，正在标记为过期。
+
+            If this issue is still relevant, please leave a comment to keep it open.
+            如果该问题仍然相关，请留言以保持其开启状态。
+
+            Otherwise, it will be closed in 5 days.
+            否则，将在 5 天后自动关闭。
+
+          close-issue-message: >-
+            This issue was closed due to prolonged inactivity after being marked stale.
+            该问题在标记为过期后因持续无活动而被关闭。
+
+            If you believe this was closed in error, please reopen it with a comment.
+            如果您认为这是错误关闭的，请留言并重新打开。
+
+          # === 行为设置 ===
+          remove-stale-when-updated: true
+          # 每次运行最大操作数（避免触发 API 速率限制）
+          operations-per-run: 30
