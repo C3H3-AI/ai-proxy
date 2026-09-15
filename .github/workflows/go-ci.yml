@@ -1,0 +1,47 @@
+name: go-ci
+
+# 门禁：编译 + 静态检查 + 单测。
+# 此前仓库无任何 CI，TECHNICAL-DOC 的审计本身是在「无 Go 工具链」下做的静态审阅，
+# 改动无法自动验证。本 workflow 补上这门禁。
+on:
+  push:
+    branches: [master, dev]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - '.github/workflows/go-ci.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - '.github/workflows/go-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: src/go.sum
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      # addon 的构建路径与本地 go build 不同（5 个二进制 + 多架构），
+      # 单独确认 Dockerfile 仍能编译，避免只在 HA 构建时才发现。
+      - name: docker build (addon 构建路径)
+        working-directory: .
+        run: docker build --build-arg BUILD_ARCH=amd64 --build-arg BUILD_VERSION=ci .

@@ -195,7 +195,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 		ConfigInfoList []struct {
 			ConfigName    string `json:"config_name"`
 			DisplayConfig struct {
-				DisplayName string `json:"display_name"`
+				DisplayName   string `json:"display_name"`
+				IsCustomModel bool   `json:"is_custom_model"` // 自定义模型（第三方代理）需额外授权
 			} `json:"display_config"`
 		} `json:"config_info_list"`
 	}
@@ -208,6 +209,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 	for _, cfg := range resp.ConfigInfoList {
 		name := strings.TrimSpace(cfg.ConfigName)
 		if name == "" || seen[name] {
+			continue
+		}
+		// 跳过自定义模型（第三方代理，调用需额外授权，选中必失败）：
+		// 部分模型上游不返回 is_custom_model，用 config_name 前缀兜底。
+		if cfg.DisplayConfig.IsCustomModel || strings.HasPrefix(name, "custom_model_") {
+			log.Printf("traework skip custom model: %s", name)
 			continue
 		}
 		seen[name] = true

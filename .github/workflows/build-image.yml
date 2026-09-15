@@ -1,0 +1,129 @@
+name: Build Add-on Image
+
+# 预构建镜像（HA 官方推荐的发布方式）。
+#
+# 现状对比：
+#   现在 = Supervisor 在用户设备上编译（拉 golang 镜像 + 编 5 个 Go 二进制），
+#          树莓派上可能十几分钟，网络抖动即失败。官方称此法应"migrate away"。
+#   本流程 = 在 CI 编译 amd64 + aarch64，推到 ghcr.io，用户只下载镜像。
+#
+# 用 HA 官方 builder actions（home-assistant/builder），而非手写 buildx：
+# 它会自动注入 BUILD_ARCH / BUILD_VERSION，并写入 io.hass.* 标签。
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'config.yaml'
+      - 'Dockerfile'
+      - 'src/**'
+      - 'run.sh'
+      - 'login_ui.py'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要构建的版本（留空则读 config.yaml）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  ARCHITECTURES: '["amd64", "aarch64"]'
+  IMAGE_NAME: ai-proxy
+
+jobs:
+  init:
+    name: Resolve version & matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version }}" ]; then
+            VER="${{ inputs.version }}"
+          else
+            VER="$(python3 .github/scripts/read_addon_version.py config.yaml)"
+          fi
+          echo "version=${VER}" >> $GITHUB_OUTPUT
+          echo "Building version: ${VER}"
+
+      - name: Get build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@7.2.0
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          image-name: ${{ env.IMAGE_NAME }}
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: init
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        uses: home-assistant/builder/actions/build-image@7.2.0
+        with:
+          arch: ${{ matrix.arch }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ matrix.image }}
+          image-tags: |
+            ${{ needs.init.outputs.version }}
+            latest
+          push: "true"
+          version: ${{ needs.init.outputs.version }}
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: [init, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      packages: write
+    steps:
+      - name: Publish multi-arch manifest
+        uses: home-assistant/builder/actions/publish-multi-arch-manifest@7.2.0
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ env.IMAGE_NAME }}
+          image-tags: |
+            ${{ needs.init.outputs.version }}
+            latest
+
+  # 关键校验：config.yaml 的 version 必须与镜像 tag 一致。
+  # 官方文档明确：image 模式下 version "needs to match the tag of the image"。
+  # 不一致 = 用户拉不到镜像，且是静默的——所以在这里显式失败。
+  verify:
+    name: Verify image reachable
+    needs: [init, manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify manifest tag matches config.yaml version
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          VERSION="${{ needs.init.outputs.version }}"
+          echo "Checking ${IMAGE}:${VERSION}"
+          if ! docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Image ${IMAGE}:${VERSION} not found — config.yaml version 与镜像 tag 不一致，用户将无法安装"
+            exit 1
+          fi
+          echo "Image ${IMAGE}:${VERSION} is reachable"

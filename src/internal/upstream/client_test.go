@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rockswang/workbuddy-wild/internal/auth"
 )
@@ -229,5 +230,35 @@ func TestRegionBases(t *testing.T) {
 	}
 	if c.chatBase(gl) != "https://gchat.example" || c.billingBase(gl) != "https://gbilling.example" {
 		t.Error("global bases wrong")
+	}
+}
+
+// TestStreamClientHasNoTotalTimeout 校验 chat SSE 走的是无总时长上限的 client。
+// http.Client.Timeout 会把「读取响应体」一并计时，用带 Timeout 的 client 会让
+// 超过阈值的长回答在流中途被切断（客户端收到截断流）。
+func TestStreamClientHasNoTotalTimeout(t *testing.T) {
+	c := New()
+	if c.StreamHTTP == nil {
+		t.Fatal("StreamHTTP not configured")
+	}
+	if c.StreamHTTP.Timeout != 0 {
+		t.Errorf("StreamHTTP.Timeout=%v want 0 (no total cap)", c.StreamHTTP.Timeout)
+	}
+	if got := c.streamClient(); got != c.StreamHTTP {
+		t.Error("streamClient() should return StreamHTTP when set")
+	}
+	// 首字节仍需有超时约束，否则建连后可能永久挂起。
+	tr, ok := c.StreamHTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("StreamHTTP.Transport type = %T", c.StreamHTTP.Transport)
+	}
+	if tr.ResponseHeaderTimeout != 120*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 120s", tr.ResponseHeaderTimeout)
+	}
+
+	// 未设置 StreamHTTP 时回退到 HTTP，保证零值 Client 仍可用。
+	fallback := &Client{HTTP: &http.Client{Timeout: time.Second}}
+	if got := fallback.streamClient(); got != fallback.HTTP {
+		t.Error("streamClient() should fall back to HTTP when StreamHTTP is nil")
 	}
 }

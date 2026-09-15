@@ -87,4 +87,9 @@ cd D:/ai-hub/integrations/ha-ai-proxy/src
 go build ./... && go vet ./internal/...
 ```
 
-构建由 HA addon 的 `build.yaml` + `Dockerfile` 多架构自动化完成。
+构建由 GitHub Actions 用 HA 官方 builder actions 完成多架构（amd64/aarch64）
+预构建并推送 GHCR，见 `.github/workflows/build-image.yml`。
+
+> 注意：`sync_vendor.sh` 的 `PROTECT_FILES` 目前**未包含** `handler.go`、
+> `traework/client.go`、`upstream/client.go`。若在这些文件里做了 addon 侧修复，
+> 跑 sync 前先确认它们已被保护，否则会被上游版本静默覆盖。

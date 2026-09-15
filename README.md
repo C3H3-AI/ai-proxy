@@ -51,7 +51,15 @@ make vet                # 静态检查
 
 ## 构建
 
-多架构（amd64 / aarch64）由 HA add-on 构建系统按 `build.yaml` + `Dockerfile` 自动完成。
+多架构（amd64 / aarch64）镜像由 GitHub Actions 用 HA 官方 builder actions
+预构建并推送到 `ghcr.io/c3h3-ai/ai-proxy`，见 `.github/workflows/build-image.yml`。
+Supervisor 直接拉镜像，不在用户设备上编译。
+
+> `build.yaml` 已移除：它是 legacy builder 的配置，自 Supervisor 2026.04.0 起
+> **不再被读取**（官方文档：*"This file is no longer used"*）。基础镜像由
+> Dockerfile 的 `FROM` 决定，`BUILD_VERSION` / `BUILD_ARCH` 由 Supervisor
+> 按 `config.yaml` 的 `version` 自动注入。
+
 本地验证：
 
 ```bash

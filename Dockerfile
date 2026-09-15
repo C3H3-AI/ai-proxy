@@ -29,6 +29,10 @@ FROM docker.io/library/alpine:3.20
 ARG BUILD_VERSION
 ARG BUILD_ARCH
 
+# 时区：容器默认 UTC 会让 scheduler 里 time.Now() 取到 UTC，
+# 使 options 中配置的 09:00 实际在 17:00（北京时间）触发签到 / 保活。
+ENV TZ=Asia/Shanghai
+
 LABEL \
     io.hass.version="${BUILD_VERSION}" \
     io.hass.arch="${BUILD_ARCH}" \

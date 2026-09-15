@@ -89,6 +89,10 @@ type Client struct {
 	// BillingHTTP 供账单/签到接口使用（短超时，慢网络下避免面板操作长时间假死）。
 	// 为 nil 时回退到 HTTP。
 	BillingHTTP *http.Client
+	// StreamHTTP 供 chat SSE 专用：不设总时长上限（Timeout=0），
+	// 否则 http.Client.Timeout 会把「读取响应体」一并计时，长回答超过阈值即被腰斩。
+	// 首字节由 Transport.ResponseHeaderTimeout 约束。为 nil 时回退到 HTTP。
+	StreamHTTP *http.Client
 
 	ChatBaseCN      string
 	BillingBaseCN   string
@@ -102,15 +106,27 @@ func New() *Client {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
+		// 首字节（响应头）超时：流式请求靠它防止建连后永久挂起，
+		// 与 traework 的 StreamHTTP 保持一致的 120s 口径。
+		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Client{
 		HTTP:            &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		StreamHTTP:      &http.Client{Transport: tr}, // 无总时长上限，仅受首字节超时约束
 		BillingHTTP:     &http.Client{Timeout: 30 * time.Second, Transport: tr},
 		ChatBaseCN:      "https://copilot.tencent.com",
 		BillingBaseCN:   "https://www.codebuddy.cn",
 		ChatBaseGlobal:  "https://www.workbuddy.ai",
 		BillingBaseGlob: "https://www.workbuddy.ai",
 	}
+}
+
+// streamClient 返回 chat SSE 专用客户端（无总时长上限）。
+func (c *Client) streamClient() *http.Client {
+	if c.StreamHTTP != nil {
+		return c.StreamHTTP
+	}
+	return c.HTTP
 }
 
 // billingClient 返回账单接口用的 HTTP 客户端。
@@ -229,7 +245,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	ChatHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.streamClient().Do(req)
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
