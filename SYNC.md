@@ -27,9 +27,31 @@ addon 采用「复制 + 生成式 sync + 适配层隔离」策略，而非 Go mo
 
 | 包 | 来源 | 更新策略 |
 |---|---|---|
-| `auth` `config` `login` `login_qoder` `login_trae` `pool` `provider` `qoder` `scheduler` `server` `traework` `upstream` | 上游 | **sync 生成**，不带手写改动（见 GENERATED 头） |
-| `svc` | addon 独有 | 自行维护（HA 加载 `trae-*.json`） |
-| `trae_adaptor` | addon 独有 | 自行维护（公网回调 + refreshToken 兜底，桌面版没有） |
+| `auth` `login` `login_qoder` `login_trae` `provider` `qoder` `scheduler` `traework` | 上游 | **sync 生成**，不带手写改动（见 GENERATED 头） |
+| `svc` `trae_adaptor` | addon 独有 | 自行维护 |
+| **`pool` `config` `server` `upstream`** | 上游 + **addon 改动** | ⚠️ **受保护，不被 sync 覆盖**，见下节 |
+
+## ⚠️ 受保护文件（B 类）——为什么它们不再自动同步
+
+addon 对 `pool` / `config` / `server` / `upstream` 四个包做了改动，这些改动
+**无法搬到 addon 独有包**，已逐项验证原因：
+
+| 文件 | addon 改动 | 为何无法外移 |
+|---|---|---|
+| `pool/pool.go` | `SetLowCredits`、`Pick()` 语义改为排除低积分账号 | 改了 `Pick()`/`pickExcluding()` 的**内部实现**。Go **不支持方法覆写**（同名函数放同包新文件会编译冲突）；所需状态 `lowCredit`/`lowCredits` 是**私有字段**，外部包访问不了 |
+| `config/config.go` | 新增 `LowCreditThreshold` | 被 `svc.go` 引用；字段是 `config.Config` 的一部分 |
+| `server/handler.go` | TraeWork 预刷新窗口按平台区分 | 改 `chatCompletions` 内部逻辑 |
+| `upstream/client.go` | 流式请求用无总时长上限的 client | 改 `Client` 结构体与方法 |
+
+**代价（须知情）**：这些文件**不再跟随上游自动更新**。上游若改动了它们，
+需要**人工 merge**。
+
+**这个代价目前为零**：经核对，上游自基线 `c62d0bc` 起对
+`pool` / `config` / `server` / `upstream` 的改动提交数为 **0**。
+
+**不会成为黑洞**：`sync_vendor.sh` 结束时会对这些文件做**上游差异检查**，
+若上游在基线之后改动过，会显式打印 `[WARN]` 并汇总提示需人工 merge
+（而不是静默跳过）。
 
 ## 上游更新时怎么做（一次性核对）
 
@@ -56,8 +78,15 @@ cd D:/ai-hub/integrations/ha-ai-proxy/src
 生成脚本会：
 1. 复制上游 `internal/{auth,config,login,login_qoder,login_trae,pool,provider,qoder,scheduler,server,traework,upstream}` 到 addon `src/internal/`
 2. 在每个生成文件顶部打 `// CODE GENERATED FROM wild-work@<commit> — DO NOT EDIT, run sync_vendor.sh`
-3. **不动** `svc` 和 `trae_adaptor`（addon 独有）
+3. **不动** `svc` / `trae_adaptor`（addon 独有）与 **B 类受保护文件**（见上节）
 4. 输出变更文件列表供 review
+5. **对 B 类受保护文件做上游差异检查**，上游改过的打印 `[WARN]` 提示人工 merge
+
+> ⚠️ **sync 前务必确认工作区干净**（`git status` 无未提交改动）。
+> sync 会直接覆盖 20+ 个文件，未提交的改动无法恢复。
+>
+> ⚠️ **如果上游尚未更新**（`git log OLD..HEAD` 无输出），**不要跑 sync**。
+> 跑了只会把 addon 落后的无关文件一起刷新，制造噪音 commit。
 
 ## 本地验证编译（实测可用）
 

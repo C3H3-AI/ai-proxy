@@ -28,11 +28,48 @@ COMMIT="$(cd "${UPSTREAM_DIR}" && git rev-parse --short HEAD)"
 UP_INTERNAL="${UPSTREAM_DIR}/internal"
 SYNC_PKGS="auth config login login_qoder login_trae pool provider qoder scheduler server traework upstream"
 
-# 以下文件是 addon 独有、手维护，sync 时绝不覆盖（保留本地版本）
-# 用数组 + 逐个比对，避免把换行塞进 case 模式导致匹配失效（旧写法静默失效过）
+# 上次实际同步到的上游 commit。用于判断「上游自基线后是否改动过受保护文件」。
+# 同步成功且人工确认无遗漏后，把这里更新为新的 COMMIT。
+# 见 SYNC.md「对齐基线」。
+BASELINE_COMMIT="c62d0bc"
+
+# ── 受保护文件（sync 时不覆盖，保留 addon 版本）─────────────────────────────
+#
+# 分两类，原因不同：
+#
+# 【A 类】addon 独有文件 —— 上游根本没有这些文件，PROTECT 只是显式声明。
+#
+# 【B 类】addon 修改过的上游文件 —— 这些文件上游有，但 addon 做了**无法外移**的改动。
+#         为何无法外移（已逐项验证）：
+#           - pool.go : 改了 Pick()/pickExcluding() 的**内部实现**。Go 不支持方法覆写，
+#                       同名函数放同包新文件会直接编译冲突；而所需状态
+#                       (lowCredit/lowCredits) 是**私有字段**，外部包访问不了。
+#           - config.go: 新增 LowCreditThreshold 字段，被 svc.go 引用。
+#           - server/handler.go: TraeWork 预刷新窗口按平台区分（defaultRefreshSkew）。
+#           - upstream/client.go: 流式请求改用无总时长上限的 client（StreamHTTP）。
+#
+# ⚠️ B 类的代价：这些文件**不再跟随上游自动更新**。上游若改动了它们，
+#    本脚本会在结尾**显式报告**（不会静默跳过），届时需人工 merge。
 PROTECT_FILES=(
+  # A 类：addon 独有
   "internal/login_trae/addon_extras.go"
   "internal/svc/svc.go"
+  # B 类：addon 修改过的上游文件
+  "internal/pool/pool.go"
+  "internal/config/config.go"
+  "internal/server/handler.go"
+  "internal/upstream/client.go"
+  "internal/upstream/headers.go"
+  "internal/traework/constants.go"
+)
+
+# B 类保护文件清单：用于结尾的上游差异检查。
+# 只对这些文件检查「上游相对当前 addon 副本是否已变化」。
+CHECK_UPSTREAM_FILES=(
+  "internal/pool/pool.go"
+  "internal/config/config.go"
+  "internal/server/handler.go"
+  "internal/upstream/client.go"
   "internal/upstream/headers.go"
   "internal/traework/constants.go"
 )
@@ -69,3 +106,62 @@ done
 
 echo "==> done: ${CHANGED} files changed (from wild-work@${COMMIT})"
 if [ "${CHANGED}" -gt 0 ]; then echo "    run: go build ./... && go vet ./internal/..."; fi
+
+# ── B 类保护文件的上游差异检查 ────────────────────────────────────────────
+#
+# 受保护文件不会被覆盖，但**必须让人知道上游是否动过它们** ——
+# 否则 PROTECT 就成了黑洞：上游的修复/改动被永久静默忽略。
+#
+# 判断方式：把上游当前版本按 sync 的同样方式规范化（去 CRLF、改 module 前缀、
+# 去掉 GENERATED 头），与 addon 本地版本比较。若**上游自身**相对上次同步基线
+# 发生了变化，本地副本与上游的差异就会超出 addon 自有改动，此处给出提示。
+#
+# 注意：上游文件是 CRLF、addon 是 LF，比较前必须 tr -d '\r'，
+# 否则全文件都会显示为「有差异」而失去意义（这个坑踩过）。
+echo
+echo "==> 受保护文件（B 类）上游差异检查"
+NEED_MERGE=0
+for pf in "${CHECK_UPSTREAM_FILES[@]}"; do
+  up_file="${UP_INTERNAL}/${pf#internal/}"
+  ad_file="${ADDON_INTERNAL}/${pf#internal/}"
+  if [ ! -f "${up_file}" ]; then
+    echo "    [n/a ] ${pf} — 上游已无此文件，请确认是否应移除"
+    continue
+  fi
+  if [ ! -f "${ad_file}" ]; then
+    echo "    [n/a ] ${pf} — addon 本地不存在"
+    continue
+  fi
+  # 规范化上游版本：去 CRLF、改 module 前缀
+  norm_up="$(mktemp)"
+  sed "s#wild-work/internal#github.com/rockswang/workbuddy-wild/internal#g" "${up_file}" | tr -d '\r' > "${norm_up}"
+  # addon 版本：去掉 GENERATED 头两行
+  norm_ad="$(mktemp)"
+  tail -n +3 "${ad_file}" > "${norm_ad}"
+
+  diff_lines=$(diff "${norm_up}" "${norm_ad}" 2>/dev/null | grep -c '^[<>]' || true)
+  rm -f "${norm_up}" "${norm_ad}"
+
+  if [ "${diff_lines}" -eq 0 ]; then
+    echo "    [ok  ] ${pf} — 与上游一致（addon 未改动或已同步）"
+  else
+    # 有差异是正常的（addon 自有改动）。真正要提示的是「上游在基线之后动过它」。
+    if [ -n "${BASELINE_COMMIT:-}" ]; then
+      up_changed=$(cd "${UPSTREAM_DIR}" && git log --oneline "${BASELINE_COMMIT}..${COMMIT}" -- "internal/${pf#internal/}" 2>/dev/null | wc -l || echo 0)
+      if [ "${up_changed}" -gt 0 ]; then
+        echo "    [WARN] ${pf} — 上游自基线 ${BASELINE_COMMIT} 起改动了 ${up_changed} 次，需人工 merge"
+        NEED_MERGE=$((NEED_MERGE+1))
+      else
+        echo "    [keep] ${pf} — 差异 ${diff_lines} 行（addon 自有改动；上游未动）"
+      fi
+    else
+      echo "    [keep] ${pf} — 差异 ${diff_lines} 行（addon 自有改动）"
+    fi
+  fi
+done
+
+if [ "${NEED_MERGE}" -gt 0 ]; then
+  echo
+  echo "⚠️  有 ${NEED_MERGE} 个受保护文件上游已改动，请人工 merge 后再提交。"
+  echo "    （这些文件不会自动同步，是设计使然：见 PROTECT_FILES 注释）"
+fi
