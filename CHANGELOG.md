@@ -1,5 +1,72 @@
 # Changelog
 
+## v1.1.0b14 (2026-09-15) 测试版
+
+本轮包含三类改动：独立审计发现的缺陷修复、CI/CD 基建、以及若干安全加固。
+
+### 修复
+- **签到/保活时刻偏移 8 小时**：容器缺 `ENV TZ`，`time.Now()` 取到 UTC，
+  options 里配置的 `09:00` 实际在 **17:00**（北京时间）触发。Dockerfile 补
+  `ENV TZ=Asia/Shanghai`（`tzdata` 原本已装）。**升级后触发时刻会变回配置值，
+  属预期行为变化。**
+- **TraeWork 账号被误永久禁用**：token 预刷新窗口仅 10 分钟，请求途中 token
+  失效时上游返回 401 → 判定 session dead → 账号被永久禁用、需人工重登。
+  现按平台区分窗口（TraeWork 24h / WorkBuddy 保持 10min）。
+- **长回答被中途截断**：流式请求使用了带 `Timeout` 的 HTTP client，而
+  `http.Client.Timeout` 包含**读取响应体**的时间，单次输出超 120s 即被切断。
+  现流式改用无总时长上限的 client，首字节由 `ResponseHeaderTimeout` 约束。
+- **面板列出不可用的模型**：未过滤 `is_custom_model`（第三方代理模型需额外
+  授权），用户选中后必然失败。现过滤该类型（对齐上游 `abb9b0b`）。
+- **凭证文件写入竞态（可能丢失 refreshToken）**：凭证用**固定**临时文件名
+  （`path.tmp`），而 `serverd` 与 `ctl` 是**两个独立进程**、都会写同一份文件。
+  并发下会出现 rename 竞争（实测并发 800 次失败 292 次）；更严重的是上游
+  refresh **会轮换 refreshToken**，后落盘者覆盖先落盘者，若落盘的是已失效的
+  那个，账号下次刷新即失败。现改用新增的 `internal/atomicfile`：唯一临时
+  文件名 + 跨进程 `flock` + fsync。state 文件同样处理。
+- **流式响应中途的上游错误未被识别**：上游并非只在 `status>=400` 时报错
+  （同包三处代码都显式处理 `code != 0` 的 200 响应）。流式路径此前只做逐行
+  透传，会把 `{"code":1,"msg":"余额不足"}` 这类非 SSE 内容原样写给客户端，
+  且**不触发账号冷却**，后续请求继续选中它。现透传前嗅探首行，非 SSE 帧按
+  上游错误信封解析并走既有错误分类。
+- **流式错误被完全丢弃**：`_ = Upstream.Stream(...)` 忽略返回值，且
+  `NoteSuccess` 在流式开始**之前**调用 —— 即使流失败，账号也被标记为健康。
+  现改为先透传、成功后才记成功，失败时记录日志并按类别冷却/禁用账号。
+
+### 安全
+- **管理接口默认对局域网开放**：`config.yaml` 默认 `webui_user/pass` 为空，
+  面板登录未启用时，鉴权回退为「来源在内网即放行」，而 add-on 的 `7870/tcp`
+  映射到宿主机 —— 同网段任意设备可**无认证**调用管理接口（账号列表、刷新
+  令牌、修改配置）。根因是 ingress 转发（`172.30.x`）与 LAN 直连
+  （`192.168.x`）**源 IP 同属内网，无法仅凭 IP 区分**。现未启用登录时
+  **只信任 ingress 转发与本机回环**。
+  **注意：若此前通过非 ingress 方式（如直接访问 `http://<HA>:7870`）使用
+  管理界面，升级后会被拒绝 —— 请在设置页配置面板登录账号/密码，或改走
+  ingress 入口。**
+- **面板会话 token 可预测**：原用 `sha256(time.time())` 生成，熵几乎全部
+  来自时间戳，可被枚举。现改用 `secrets.token_urlsafe(32)`（约 258 bit 熵），
+  落盘权限收紧为 `0600`，比较改用 `hmac.compare_digest`（原先的 `==` 会短路，
+  可据响应时间逐字节推断 token）。
+
+### 构建与发布
+- **预构建镜像**：改用 HA 官方 builder actions 在 CI 构建 amd64/aarch64
+  镜像并推送 `ghcr.io/c3h3-ai/ai-proxy`，`config.yaml` 增加 `image` 字段。
+  Supervisor 直接拉取镜像，**不再在用户设备上编译**（此前需拉 Go 镜像并编译
+  5 个二进制，在树莓派上可能十余分钟且易受网络影响失败）。
+- **CI/CD 门禁**：新增 `go-ci`（build/vet/test）、`pr-validate`（分支/标题/
+  描述/单一变更类型）、`pr-label`（自动打标）、`release`（tag + 草稿 release）、
+  `stale`、`sync-labels`。此前仓库无任何 CI。
+- **移除 `build.yaml`**：legacy builder 配置，自 Supervisor 2026.04.0 起
+  **不再被读取**，其 `build_from` / `args.BUILD_VERSION` 均为死配置。
+
+### 内部
+- **上游同步保护**：`sync_vendor.sh` 此前会静默覆盖 addon 对上游文件的改动，
+  实测跑一次即导致**编译失败**（`svc.go` 引用了被覆盖掉的 `pool`/`config`
+  扩展）。现将 `pool` / `config` / `server` / `upstream` 四个文件纳入
+  `PROTECT_FILES`，并在结束时对其做**上游差异检查**——上游若改动过会显式
+  告警提示人工 merge，而不再静默跳过。
+- 修正 `TestModelsDynamic` 的过期断言（v1.1.0b11 起 `/v1/models` 会追加虚拟
+  `cheapest` 条目，测试仍按 3 个断言，已失败多时）。
+
 ## v1.1.0b12 (2026-09-07) 测试版
 
 ### 变更
