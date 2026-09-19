@@ -568,6 +568,30 @@ func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrK
 		rt.Pool.Disable(uid, "session dead")
 	case provider.ErrNotFound:
 		rt.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
+
+	// ── 与账号无关：不冷却、不计数、不熔断 ──
+	//
+	// 这三类是「请求本身的问题」，换任何账号结果相同。
+	// 对它们调用 NoteError 会把健康账号冷却掉（连续 3 次 → 10 分钟），
+	// 并让调用方白白轮转、消耗其他账号的请求配额。
+	case provider.ErrContentBlocked:
+		log.Printf("upstream content blocked uid=%s（内容策略拦截，与账号无关，不罚账号）", uid)
+	case provider.ErrPromptTooLong:
+		log.Printf("upstream prompt too long uid=%s（上下文超限，请求级错误，不罚账号）", uid)
+	case provider.ErrBadParams:
+		log.Printf("upstream bad params uid=%s（请求体问题，不罚账号）", uid)
+
+	// ── 账号级故障：需冷却轮换 ──
+	case provider.ErrWafBlock:
+		rt.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "WAF 拦截")
+	case provider.ErrAccountFault:
+		// 账号自身授权/配额故障（如 11140 需重新 OAuth），
+		// 计错误并按阈值冷却，避免持续给上游送死请求。
+		rt.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+	case provider.ErrModelBlocked:
+		// 该账号在此模型上不可用 → 计错误并轮转到他号。
+		rt.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+
 	default:
 		rt.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 	}
