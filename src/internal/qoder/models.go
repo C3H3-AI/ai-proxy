@@ -43,7 +43,7 @@ func (c *Client) fetchModels(a *auth.Auth) ([]DynamicModel, error) {
 	if err != nil {
 		return nil, err
 	}
-	sess, err := NewCosySession(a.MachineID, a.MachineToken, a.MachineType, a.Nickname, a.UID, dt, a.RefreshToken)
+	sess, err := NewCosySession(a.MachineID, a.MachineToken, a.MachineType, a.Nickname, a.UIDValue(), dt, a.RefreshTokenValue())
 	if err != nil {
 		return nil, fmt.Errorf("cosy session: %w", err)
 	}
