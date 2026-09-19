@@ -47,13 +47,15 @@ func CommonHeaders(req *http.Request, a *auth.Auth) {
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 func ChatHeaders(req *http.Request, a *auth.Auth) {
 	CommonHeaders(req, a)
-	if a.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// 用锁内快照而非直读字段：本函数在请求路径上执行，而 keepalive /
+	// 请求前刷新会并发改写 token，直读会触发 DATA RACE（-race 可复现）。
+	if at := a.AccessTokenValue(); at != "" {
+		req.Header.Set("Authorization", "Bearer "+at)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if uid := a.UIDValue(); uid != "" {
+		req.Header.Set("X-User-Id", uid)
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}
@@ -78,11 +80,11 @@ func ChatHeaders(req *http.Request, a *auth.Auth) {
 
 // BillingHeaders billing 接口请求头。
 func BillingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	if uid := a.UIDValue(); uid != "" {
+		req.Header.Set("X-User-Id", uid)
 	}
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
@@ -94,6 +96,12 @@ func BillingHeaders(req *http.Request, a *auth.Auth) {
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
+//
+// ⚠️ 本函数由**持写锁**的 Client.RefreshToken 调用
+// （client.go: a.Lock() → ... → RefreshHeaders(req, a)），
+// 因此这里【必须】直读 a.RefreshToken ——
+// 若改用 RefreshTokenValue()（内部再取读锁）会造成自锁死锁
+// （实测：TestRefreshSuccess 挂起至 3 分钟超时）。
 func RefreshHeaders(req *http.Request, a *auth.Auth) {
 	CommonHeaders(req, a)
 	req.Header.Set("X-Refresh-Token", a.RefreshToken)

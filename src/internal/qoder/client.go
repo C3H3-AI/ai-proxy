@@ -253,7 +253,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	dt := a.JWT()
-	sess, err := NewCosySession(a.MachineID, a.MachineToken, a.MachineType, a.Nickname, a.UID, dt, a.RefreshToken)
+	sess, err := NewCosySession(a.MachineID, a.MachineToken, a.MachineType, a.Nickname, a.UIDValue(), dt, a.RefreshTokenValue())
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("cosy session: %w", err)
 	}
@@ -434,7 +434,11 @@ func EnsureFingerprint(a *auth.Auth) {
 	}
 }
 
+// truncate 截断到 n 字节；n <= 0 返回空串（否则 s[:n] 在 n<0 时 panic）。
 func truncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	s = strings.TrimSpace(s)
 	if len(s) > n {
 		return s[:n]

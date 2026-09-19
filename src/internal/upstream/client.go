@@ -6,10 +6,12 @@ package upstream
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -100,12 +102,22 @@ type Client struct {
 	BillingBaseGlob string
 }
 
-// New 生产默认值。配置连接池减少 TLS 握手。
+// New 生产默认值。Transport 加固（对齐上游 wild-work v2.2.0）：
+// 禁 h2 + Dial 超时/keepalive + TLS 握手超时 + 首字节超时。
+//
+// 为何禁 h2：上游对 HTTP/2 多路复用下的流式行为不稳定，且部分中间设备
+// 会破坏 h2 的流；上游实测后固定走 HTTP/1.1（TLSNextProto 置空即禁用 h2）。
 func New() *Client {
+	// Dial 与 TLS 握手各自设超时：仅靠 Client.Timeout 无法覆盖建连阶段，
+	// 网络抖动时会出现长时间无响应（且流式 client 没有总时长上限）。
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
 	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
+		DialContext:           dialer.DialContext,
+		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper), // 禁 h2
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
 		// 首字节（响应头）超时：流式请求靠它防止建连后永久挂起，
 		// 与 traework 的 StreamHTTP 保持一致的 120s 口径。
 		ResponseHeaderTimeout: 120 * time.Second,
@@ -584,7 +596,11 @@ func parseCredits(s string) float64 {
 	return v
 }
 
+// truncate 截断到 n 字节；n <= 0 返回空串（否则 s[:n] 在 n<0 时 panic）。
 func truncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	s = strings.TrimSpace(s)
 	if len(s) > n {
 		return s[:n]
