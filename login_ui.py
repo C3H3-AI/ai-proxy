@@ -628,9 +628,21 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     def _is_ingress(self):
         """是否为 HA ingress 转发请求。
 
-        ingress 会把请求转发到 127.0.0.1 并在路径上保留
-        /api/hassio_ingress/<token>/ 前缀（与第 1081 行的同款判断一致）。
+        ⚠️ 不能用「路径是否含 /hassio_ingress/」判断 —— 那是错的：
+        HA Supervisor 的反代会**剥离该前缀**再转发
+        （supervisor/api/ingress.py 的 handler：
+         path = request.match_info["path"]，再拼成
+         http://<ip>:<port>/{path}），
+        所以容器内看到的 self.path 是 "/api/accounts" 这样的裸路径。
+
+        真正的标志是 Supervisor 注入的 X-Remote-User-* 头 ——
+        仅 ingress 请求会带（见同文件 _init_header）。
+        路径前缀只作为兜底保留。
         """
+        if (self.headers.get("X-Remote-User-Id")
+                or self.headers.get("X-Remote-User-Name")
+                or self.headers.get("X-Remote-User-Display-Name")):
+            return True
         path = self.path or ""
         return path.startswith("/api/hassio_ingress/") or "/hassio_ingress/" in path
 

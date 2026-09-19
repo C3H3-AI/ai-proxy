@@ -163,14 +163,14 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		log.Printf("traework chat_stream uid=%s: transport error: %v", a.UID, err)
+		log.Printf("traework chat_stream uid=%s: transport error: %v", a.UIDValue(), err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("traework chat_stream uid=%s: upstream %d %s body=%s", a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		log.Printf("traework chat_stream uid=%s: upstream %d %s body=%s", a.UIDValue(), resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
 	return resp.Body, resp.StatusCode, nil, nil
@@ -234,7 +234,7 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.AccessToken)
+	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.AccessTokenValue())
 	req.Header.Set("X-Trae-Client-Type", "web")
 	req.Header.Set("X-Trae-User-Timezone", "Asia/Shanghai")
 	req.Header.Set("X-Preferenced-Language", "zh-cn")
@@ -594,7 +594,11 @@ func (c *Client) Classify(status int, body string) provider.ErrKind { return Cla
 func (c *Client) Stream(w http.ResponseWriter, r io.Reader) error   { return Stream(w, r) }
 func (c *Client) Aggregate(r io.Reader) (map[string]any, error)     { return Aggregate(r) }
 
+// truncate 截断到 n 字节；n <= 0 返回空串（否则 s[:n] 在 n<0 时 panic）。
 func truncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	s = strings.TrimSpace(s)
 	if len(s) > n {
 		return s[:n]
