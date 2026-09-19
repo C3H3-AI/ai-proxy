@@ -33,7 +33,20 @@ const (
 	ErrSessionDead                // 登录态失效 → 禁用
 	ErrNotFound                   // 404 上游偶发 → 短冷却不累计 errCount
 	ErrServer                     // 5xx 上游故障
-	ErrClient                     // 其他 4xx / 业务错误
+	ErrClient                     // 其他 4xx / 业务错误（默认兜底）
+
+	// ── 「与账号无关」的错误：不应罚账号 ──
+	// 依据：把「请求本身的问题」与「账号的问题」分开，避免把健康账号误冷却，
+	// 或对确定无解的请求反复轮转、白白消耗其他账号的配额。
+	// （对齐上游 wb2api 的 errorRule 策略）
+	ErrContentBlocked // 内容策略拦截（400 + 审核文案）→ 不罚账号
+	ErrPromptTooLong  // 上下文超限（11115）→ 请求级错误，不罚号不轮转
+	ErrBadParams      // 请求体解析失败（11101）→ 不罚号，但仍轮转
+
+	// ── 账号级故障：需冷却或禁用 ──
+	ErrWafBlock     // 403 + 非业务信封（WAF 拦截页/空体）→ 账号软冷却
+	ErrAccountFault // 账号级授权/配额故障（11140 / 14017）→ 冷却轮换
+	ErrModelBlocked // 11102 该后端无此模型 → 按 (账号,模型) 避让
 )
 
 func (k ErrKind) String() string {
@@ -50,8 +63,37 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrContentBlocked:
+		return "content_blocked"
+	case ErrPromptTooLong:
+		return "prompt_too_long"
+	case ErrBadParams:
+		return "bad_params"
+	case ErrWafBlock:
+		return "waf_block"
+	case ErrAccountFault:
+		return "account_fault"
+	case ErrModelBlocked:
+		return "model_blocked"
 	default:
 		return "none"
+	}
+}
+
+// PenalizesAccount 报告该错误是否应影响账号健康度（冷却/错误计数/熔断）。
+//
+// 「不罚账号」的三类都是**请求本身的问题**，换任何账号结果相同：
+//   - ErrContentBlocked：上游按逐字指纹审核，system 来源的模板句触发误报
+//   - ErrPromptTooLong：上下文超限，与账号无关
+//   - ErrBadParams：发出去的 body 有问题
+//
+// 对它们调用 NoteError 会把健康账号冷却掉，并浪费其他账号的请求配额。
+func (k ErrKind) PenalizesAccount() bool {
+	switch k {
+	case ErrContentBlocked, ErrPromptTooLong, ErrBadParams:
+		return false
+	default:
+		return true
 	}
 }
 

@@ -31,6 +31,16 @@ const (
 	ErrNotFound    = provider.ErrNotFound    // 404 上游偶发 → 短冷却不累计 errCount（防雪崩）
 	ErrServer      = provider.ErrServer      // 5xx 上游故障
 	ErrClient      = provider.ErrClient      // 其他 4xx / 业务错误
+
+	// 与账号无关（不罚账号，见 provider.ErrKind.PenalizesAccount）
+	ErrContentBlocked = provider.ErrContentBlocked // 400 + 内容审核文案
+	ErrPromptTooLong  = provider.ErrPromptTooLong  // 11115 上下文超限
+	ErrBadParams      = provider.ErrBadParams      // 11101 请求体解析失败
+
+	// 账号级故障
+	ErrWafBlock     = provider.ErrWafBlock     // 403 + 非业务信封
+	ErrAccountFault = provider.ErrAccountFault // 11140 / 14017
+	ErrModelBlocked = provider.ErrModelBlocked // 11102 无此模型
 )
 
 // Error 带分类的上游错误。
@@ -62,11 +72,49 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
+
+	// ── 与账号无关的三类（必须早于通用 4xx 兜底）──
+	//
+	// 内容策略拦截：上游按逐字精确指纹审核，system 来源的模板句
+	// （Claude Code / Codex 注入的指令）会触发 HTTP 400 + 下列文案。
+	// 属「合法流量被误杀」，与账号健康无关。
+	if containsAny(lower, contentBlockedMarkers) {
+		return ErrContentBlocked
+	}
+	// 上下文超限（11115）：同一个 body 换任何账号都会超限 → 请求的问题。
+	if strings.Contains(body, "11115") || strings.Contains(lower, "prompt is too long") {
+		return ErrPromptTooLong
+	}
+	// body 解析失败（11101）：发出去的请求体有问题。
+	if status == http.StatusBadRequest &&
+		(strings.Contains(body, `"code":11101`) ||
+			strings.Contains(lower, "unmarshal chat params failed")) {
+		return ErrBadParams
+	}
+
+	// ── 账号级故障（11140 request illegal / 14017 trial 未激活）──
+	//
+	// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案
+	// （"The model provider is rate-limiting requests."），那种场景必须保持
+	// ErrSoftRate。故此处只收 auth_forbidden 的真实文案。
+	if containsAny(lower, accountFaultMarkers) {
+		return ErrAccountFault
+	}
+
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
+	}
+	// WAF 拦截：403 且 body 不是业务信封（拦截页 / 空体）。
+	// 放在通用 4xx 之前，否则会被当作普通客户端错误而不冷却账号。
+	if status == http.StatusForbidden && !looksLikeAPIEnvelope(body) {
+		return ErrWafBlock
+	}
+	// 11102 该后端无此模型 → 由调用方按 (账号,模型) 避让。
+	if strings.Contains(body, "11102") {
+		return ErrModelBlocked
 	}
 	if status >= 500 {
 		return ErrServer
@@ -76,6 +124,48 @@ func Classify(status int, body string) ErrKind {
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+// contentBlockedMarkers 内容策略拦截文案（大小写不敏感子串）。
+var contentBlockedMarkers = []string{
+	"blocked by security policy",
+	"unapproved channel",
+	"illegal api invocation",
+}
+
+// accountFaultMarkers 账号级授权/配额故障文案。
+//
+// 这类错误由**账号自身状态**决定：继续重试只会反复触发上游风控/配额检查，
+// 必须冷却轮换。
+//   - "request illegal"（code 11140）→ auth_forbidden，账号级授权风控，
+//     需重新 OAuth 登录才能恢复。
+//   - "trial not activated"（code 14017）→ 注册未完成的试用账号，同样账号级。
+var accountFaultMarkers = []string{
+	"request illegal",
+	"trial not activated",
+	"trial version is not yet activated",
+}
+
+func containsAny(lowerBody string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(lowerBody, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeAPIEnvelope 粗判 body 是否为上游业务信封（含 code 字段的 JSON）。
+// 用于区分「上游的业务错误」与「中间设备/WAF 返回的拦截页」。
+func looksLikeAPIEnvelope(body string) bool {
+	t := strings.TrimSpace(body)
+	if t == "" {
+		return false // 空体：典型 WAF 拦截
+	}
+	if !strings.HasPrefix(t, "{") {
+		return false // HTML / 文本拦截页
+	}
+	return strings.Contains(t, `"code"`)
 }
 
 // apiEnvelope 上游统一信封。
