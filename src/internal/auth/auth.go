@@ -55,6 +55,33 @@ func (a *Auth) JWT() string {
 	return a.AccessToken
 }
 
+// AccessTokenValue 锁内快照：出站请求头用，防止与 keepalive/请求前刷新
+// 并发写 token 时读到半更新值（-race 可复现 DATA RACE）。
+//
+// 与 JWT() 的区别仅在命名语义：JWT 用于 TraeWork 的 Cloud-IDE-JWT 头，
+// 本方法用于 WorkBuddy 的 Bearer 头。两者实现相同，保留两个名字是为了
+// 调用点自解释。
+func (a *Auth) AccessTokenValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.AccessToken
+}
+
+// RefreshTokenValue 锁内快照：防止调度器/登录流程在锁外直读 RefreshToken
+// 与 refresh 写回竞争。
+func (a *Auth) RefreshTokenValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.RefreshToken
+}
+
+// UIDValue 锁内快照：出站头里的 uid 同理需要防竞态。
+func (a *Auth) UIDValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.UID
+}
+
 // NeedsRefreshLocked 是 NeedsRefresh 的持锁内部版本；调用方必须已持有读/写锁。
 func (a *Auth) NeedsRefreshLocked(within time.Duration) bool {
 	if a.ExpiresAt <= 0 {

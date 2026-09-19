@@ -261,7 +261,11 @@ func SaveAuth(authDir string, r Result) (string, error) {
 	return fp, nil
 }
 
+// truncate 截断到 n 字节；n <= 0 返回空串（否则 s[:n] 在 n<0 时 panic）。
 func truncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	s = string(bytes.TrimSpace([]byte(s)))
 	if len(s) > n {
 		return string(s[:n])
