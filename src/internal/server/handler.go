@@ -147,18 +147,30 @@ func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
 func (h *Handler) pickWithSticky(rt *Runtime, freeModel bool) *auth.Auth {
 	const defaultMaxReqs = 50
 
+	// ⚠️ 必须在锁内把字段**拷贝出来**，不能只取指针。
+	// stickyEntry 是共享对象：stickySuccess 在写锁内改 reqCount，
+	// 若这里解锁后再读 sticky.reqCount，就与写者构成 DATA RACE
+	// （-race 下可复现：pickWithSticky:154 读 vs stickySuccess:195 写）。
 	h.stickyMu.RLock()
-	sticky := h.sticky[h.stickyKey(rt.Kind)]
+	e := h.sticky[h.stickyKey(rt.Kind)]
+	var (
+		uid      string
+		reqCount int
+		maxReqs  int
+	)
+	if e != nil {
+		uid, reqCount, maxReqs = e.uid, e.reqCount, e.maxReqs
+	}
 	h.stickyMu.RUnlock()
 
 	// 尝试粘性路由：账号必须健康，且对当前模型模式可用（付费模型要求非低积分）
-	if sticky != nil && sticky.uid != "" && sticky.reqCount < sticky.maxReqs {
-		acct := rt.Pool.AuthByUID(sticky.uid)
+	if uid != "" && reqCount < maxReqs {
+		acct := rt.Pool.AuthByUID(uid)
 		if acct != nil {
-			status, ok := rt.Pool.Status(sticky.uid)
+			status, ok := rt.Pool.Status(uid)
 			if ok && !status.Cooling && !status.Disabled && (freeModel || !status.LowCredit) {
 				log.Printf("sticky route platform=%s uid=%s count=%d/%d free_model=%v",
-					rt.Kind, sticky.uid, sticky.reqCount, sticky.maxReqs, freeModel)
+					rt.Kind, uid, reqCount, maxReqs, freeModel)
 				return acct
 			}
 		}
