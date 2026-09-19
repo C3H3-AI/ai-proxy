@@ -32,6 +32,16 @@ func Classify(status int, body string) provider.ErrKind {
 		}
 		return provider.ErrSessionDead
 	}
+
+	// ── 与账号无关的请求级错误（必须早于通用 4xx 兜底）──
+	// 若不在此拦截，会被 ErrClient 兜底 → handler 对它 NoteError
+	// → 连续 3 次把健康账号冷却 10 分钟（见 provider.PenalizesAccount）。
+	if containsAny(lower, contentBlockedMarkers) {
+		return provider.ErrContentBlocked
+	}
+	if strings.Contains(body, "11115") || strings.Contains(lower, "prompt is too long") {
+		return provider.ErrPromptTooLong
+	}
 	if status == http.StatusTooManyRequests {
 		return provider.ErrSoftRate
 	}
@@ -45,6 +55,22 @@ func Classify(status int, body string) provider.ErrKind {
 		return provider.ErrClient
 	}
 	return provider.ErrNone
+}
+
+// contentBlockedMarkers 内容策略拦截文案（与 upstream 包同口径）。
+var contentBlockedMarkers = []string{
+	"blocked by security policy",
+	"unapproved channel",
+	"illegal api invocation",
+}
+
+func containsAny(lowerBody string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(lowerBody, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // Client Trae SOLO 上游 HTTP 客户端。
