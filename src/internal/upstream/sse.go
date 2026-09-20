@@ -31,7 +31,30 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		gotAnyContent bool
 		toolCalls     = map[int]map[string]any{}
 		toolOrder     []int
+		toolSeq       int            // 缺 index 时的跳号分配游标
+		idIndex       = map[string]int{} // tool_call id → 分配的 index
 	)
+
+	// appendContent 是「已取到正文」的**唯一**写入点：空串不置 latch。
+	// 若空 content 帧也置 gotAnyContent，后续 message 形态的正文
+	// 会被 !gotAnyContent 判断挡住而**永久丢弃**（上游 issue #142）。
+	appendContent := func(txt string) {
+		if txt == "" {
+			return
+		}
+		content.WriteString(txt)
+		gotAnyContent = true
+	}
+	// nextToolIndex 分配一个未被占用的 index（跳号，避免与已有条目冲突）。
+	nextToolIndex := func() int {
+		for {
+			idx := toolSeq
+			toolSeq++
+			if _, used := toolCalls[idx]; !used {
+				return idx
+			}
+		}
+	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -41,7 +64,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if strings.HasPrefix(line, "data: ") {
 			payload := strings.TrimPrefix(line, "data: ")
 			if payload == "[DONE]" {
-				// drain nothing; done
+				// 结束标记；无需额外处理（聚合在 EOF 收尾）
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
@@ -71,8 +94,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 									role = r2
 								}
 								if txt, ok := delta["content"].(string); ok {
-									content.WriteString(txt)
-									gotAnyContent = true
+									appendContent(txt)
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
 									reasoning.WriteString(rc)
@@ -83,9 +105,26 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 										if !ok {
 											continue
 										}
-										idx := 0
+										// index 分派（对齐上游 wb2api）：
+										//   1) 显式 index 优先
+										//   2) 否则按 id 复用/新分配
+										//   3) 否则沿用上一个 index（沿用流式分片语义）
+										//   4) 否则跳号新分配
+										// 原实现把缺 index 一律当 0，会让多个 tool_call
+										// 挤到同一条目上互相覆盖，参数错乱。
+										idx := -1
 										if v, ok := call["index"].(float64); ok {
 											idx = int(v)
+										} else if cid, _ := call["id"].(string); cid != "" {
+											if mid, seen := idIndex[cid]; seen {
+												idx = mid
+											} else {
+												idx = nextToolIndex()
+											}
+										} else if len(toolOrder) > 0 {
+											idx = toolOrder[len(toolOrder)-1]
+										} else {
+											idx = nextToolIndex()
 										}
 										merged, seen := toolCalls[idx]
 										if !seen {
@@ -93,14 +132,20 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 											toolCalls[idx] = merged
 											toolOrder = append(toolOrder, idx)
 										}
+										if cid, _ := call["id"].(string); cid != "" {
+											idIndex[cid] = idx
+										}
 										mergeToolCallDelta(merged, call)
+										if cid, _ := merged["id"].(string); cid != "" {
+											idIndex[cid] = idx
+										}
 									}
 								}
 							}
 							// 有的上游把完整消息放在 message 里（非 delta）
 							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
 								if txt, ok := msg["content"].(string); ok {
-									content.WriteString(txt)
+									appendContent(txt)
 								}
 							}
 						}
