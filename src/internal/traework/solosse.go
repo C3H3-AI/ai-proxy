@@ -154,6 +154,8 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		usage        map[string]any
 		toolCalls    = map[int]map[string]any{}
 		toolOrder    []int
+		toolSeq      int
+		idIndex      = map[string]int{}
 		upstreamErr  error
 	)
 	st := &sseState{}
@@ -171,7 +173,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			case "output":
 				content.WriteString(ev.Response)
 				reasoning.WriteString(ev.Reasoning)
-				mergeToolCallJSON(toolCalls, &toolOrder, ev.ToolCalls)
+				mergeToolCallJSON(toolCalls, &toolOrder, ev.ToolCalls, &toolSeq, idIndex)
 			case "token_usage":
 				usage = ev.Usage
 			case "done":
@@ -228,7 +230,18 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 
 // mergeToolCallJSON 把 SOLO output.tool_calls（json.RawMessage，可能 null/对象/数组）
 // 合并进 toolCalls（按 index）。
-func mergeToolCallJSON(toolCalls map[int]map[string]any, toolOrder *[]int, raw json.RawMessage) {
+// mergeToolCallJSON 合并一批 tool_call 分片。
+//
+// index 分派顺序（与 upstream.Aggregate 同口径）：
+//  1. 显式 index 优先；
+//  2. 否则按 id 复用已分配的 index，未见过的 id 则跳号新分配；
+//  3. 否则沿用上一个 index（流式分片语义：同一条目的后续片段常不带 index/id）；
+//  4. 都没有则跳号新分配。
+//
+// ⚠️ 原实现把「缺 index」一律当 0，导致一批互不相关的 tool_call
+// 全部挤进 index 0 互相覆盖 —— tool_call 数量变少、arguments 拼接错乱。
+func mergeToolCallJSON(toolCalls map[int]map[string]any, toolOrder *[]int, raw json.RawMessage,
+	toolSeq *int, idIndex map[string]int) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return
 	}
@@ -240,13 +253,32 @@ func mergeToolCallJSON(toolCalls map[int]map[string]any, toolOrder *[]int, raw j
 		}
 		arr = []map[string]any{one}
 	}
+	nextIdx := func() int {
+		for {
+			i := *toolSeq
+			*toolSeq++
+			if _, used := toolCalls[i]; !used {
+				return i
+			}
+		}
+	}
 	for _, call := range arr {
 		if call == nil {
 			continue
 		}
-		idx := 0
+		idx := -1
 		if v, ok := call["index"].(float64); ok {
 			idx = int(v)
+		} else if cid, _ := call["id"].(string); cid != "" {
+			if mid, seen := idIndex[cid]; seen {
+				idx = mid
+			} else {
+				idx = nextIdx()
+			}
+		} else if len(*toolOrder) > 0 {
+			idx = (*toolOrder)[len(*toolOrder)-1]
+		} else {
+			idx = nextIdx()
 		}
 		merged, seen := toolCalls[idx]
 		if !seen {
@@ -254,7 +286,13 @@ func mergeToolCallJSON(toolCalls map[int]map[string]any, toolOrder *[]int, raw j
 			toolCalls[idx] = merged
 			*toolOrder = append(*toolOrder, idx)
 		}
+		if cid, _ := call["id"].(string); cid != "" {
+			idIndex[cid] = idx
+		}
 		mergeToolCallDelta(merged, call)
+		if cid, _ := merged["id"].(string); cid != "" {
+			idIndex[cid] = idx
+		}
 	}
 }
 
