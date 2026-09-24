@@ -159,7 +159,7 @@ python3 scripts/test_session_token.py   # 会话 token 生成与比较
 
 当前 `1.1.0b14`。详见 `CHANGELOG.md`。
 
-> ⚠️ 另一个仓库 `C3H3-AI/ai-proxy-test` 提供的是 `2.0.1` 构建，**落后于本仓库**——
+> ⚠️ 另一个仓库 `c3h3-bi/ai-proxy-test` 提供的是 `2.0.1` 构建，**落后于本仓库**——
 > 它停在 2026-08-27，不含 TraeWork 通道修复（4008）、WorkBuddy 客户端识别头、
 > 面板登录鉴权等 8/30 之后的改动，且 addon 位于 `ai-proxy/` 子目录、
 > 构建上下文与本仓库不同（`COPY . /src` vs `COPY src /src`）。
