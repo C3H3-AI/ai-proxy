@@ -49,7 +49,7 @@
 
 ### 构建与发布
 - **预构建镜像**：改用 HA 官方 builder actions 在 CI 构建 amd64/aarch64
-  镜像并推送 `ghcr.io/c3h3-ai/ai-proxy`，`config.yaml` 增加 `image` 字段。
+  镜像并推送 `ghcr.io/c3h3-ci/ai-proxy`，`config.yaml` 增加 `image` 字段。
   Supervisor 直接拉取镜像，**不再在用户设备上编译**（此前需拉 Go 镜像并编译
   5 个二进制，在树莓派上可能十余分钟且易受网络影响失败）。
 - **CI/CD 门禁**：新增 `go-ci`（build/vet/test）、`pr-validate`（分支/标题/
