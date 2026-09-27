@@ -208,7 +208,7 @@ func (r *Runtime) FeesInfo() map[string]any {
 	}
 
 	result := map[string]any{
-		"note":       "费率随上游平台政策动态变化，请以官方为准；点击「刷新费率」重新拉取。",
+		"note":       "费率随上游平台政策动态变化，请以官方为准；已开启每小时自动刷新，也可点击「刷新费率」立即拉取。",
 		"channels":   channels,
 		"disclaimer": "本工具仅聚合转发，不参与定价；渠道费率以各上游官方页面为准。",
 		"cached_at":  fetched.Format("01-02 15:04"),
@@ -241,12 +241,24 @@ func (r *Runtime) RefreshPricing() {
 		}
 		acct := rt.pool.Pick()
 		if acct == nil {
+			// Pick 排除低积分账号；若该渠道账号全是低积分，旧逻辑在这里 continue，
+			// 该渠道的费率就永远拉不到 → 路由判定时费率未知被保守视为付费模型
+			// → 低积分账号连免费模型都进不去（「0 积分免费的也不能用」）。
+			// 回退到低积分账号：拉费率只是只读查询，不受低积分标记限制。
+			acct = rt.pool.PickLowCredit()
+		}
+		if acct == nil {
 			continue
 		}
 		if acct.NeedsRefresh(10 * time.Minute) {
 			if err := rt.up.RefreshToken(acct); err != nil {
 				errs = append(errs, rt.name+": token refresh failed")
 				continue
+			}
+			// 上游 refresh 会轮换 refreshToken，必须落盘：否则只更新了内存，
+			// 下次刷新仍用旧 refreshToken 会失败（定时刷新会让这个风险暴露得更频繁）。
+			if err := acct.SaveAtomic(); err != nil {
+				log.Printf("pricing refresh save failed platform=%s err=%v", rt.name, err)
 			}
 		}
 		pricing, err := rt.up.FetchModelPricing(acct)

@@ -530,7 +530,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if status >= 400 {
 			kind := rt.Upstream.Classify(status, string(respBody))
-			h.applyUpstreamError(rt, acct.UID, kind)
+			h.applyUpstreamError(rt, acct.UID, kind, freeModel)
 			h.stickyClear(rt)
 			lastErr = &provider.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			continue
@@ -548,7 +548,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if ue, ok := serr.(*provider.Error); ok {
 					log.Printf("stream error platform=%s uid=%s kind=%s msg=%s",
 						rt.Kind, acct.UID, ue.Kind, ue.Msg)
-					h.applyUpstreamError(rt, acct.UID, ue.Kind)
+					h.applyUpstreamError(rt, acct.UID, ue.Kind, freeModel)
 				} else {
 					log.Printf("stream i/o error platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
 				}
@@ -585,16 +585,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 后者此前会被完全忽略（`_ = Stream(...)`），导致：
 //   1. 账号仍被标记为健康（NoteSuccess 在 Stream 之前调用）；
 //   2. 后续请求继续选中这个实际不可用的账号。
-func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrKind) {
+//
+// freeModel 表示本次请求是否为 0 费率（免费）模型，用于区分「免费额度用完」的
+// 惩罚力度：免费模型失败只需换号重试，不该把账号冷却到次日。
+func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrKind, freeModel bool) {
 	switch kind {
 	case provider.ErrHardCredit:
 		// 依据账号实际状态，而非模型费率，判断是否属于「免费额度已用完」：
-		// 低积分账号即使调用 0 费率模型仍报余额不足 → 禁用到次日自动恢复。
-		if st, ok := rt.Pool.Status(uid); ok && st.LowCredit {
+		// 低积分账号即使调用 0 费率模型仍报余额不足。
+		st, ok := rt.Pool.Status(uid)
+		switch {
+		case ok && st.LowCredit && freeModel:
+			// 低积分账号调免费模型失败：不能冷却到次日 0 点（那会让该账号当天
+			// 连免费模型都彻底吃不到，表现为「0 积分免费的也不能用」）。
+			// 改为短冷却换号重试，稍后仍可重新参与轮转。
+			rt.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "免费模型额度受限，换号重试")
+		case ok && st.LowCredit:
 			now := time.Now()
 			until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
 			rt.Pool.Cooldown(uid, pool.CoolHard, until.Sub(now), "免费额度已用完，次日恢复")
-		} else {
+		default:
 			rt.Pool.Cooldown(uid, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
 		}
 	case provider.ErrSoftRate:

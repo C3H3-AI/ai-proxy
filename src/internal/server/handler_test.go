@@ -543,3 +543,45 @@ func TestStreamUpstreamErrorIn200CoolsAccount(t *testing.T) {
 		t.Errorf("上游报错后账号未冷却/禁用（修复前即为该症状）: %+v", st)
 	}
 }
+
+// TestHardCreditCooldownDependsOnFreeModel —— 低积分账号「余额/权益不足」的惩罚力度。
+//
+// 修复前：低积分账号无论调什么模型都冷却到次日 0 点，导致当天连免费模型也吃不到
+//        （用户反馈「0 积分会导致免费的也无法使用」）。
+// 修复后：免费（0 费率）模型失败只做短冷却换号重试；付费模型失败仍按硬冷却处理。
+func TestHardCreditCooldownDependsOnFreeModel(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.ReenableIfCredits("u1", 0) // 0 积分 → 标记 lowCredit
+	if st, _ := p.Status("u1"); !st.LowCredit {
+		t.Fatalf("前置条件不成立，期望 lowCredit: %+v", st)
+	}
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		HardCooldown: 12 * time.Hour, SoftCooldown: time.Minute,
+		ErrThreshold: 3, ErrCooldown: 10 * time.Minute,
+	})
+	rt := h.cfg.Runtimes[provider.WorkBuddy]
+
+	// 免费模型：短冷却，账号稍后仍可参与轮转
+	h.applyUpstreamError(rt, "u1", provider.ErrHardCredit, true)
+	st, _ := p.Status("u1")
+	if !st.Cooling {
+		t.Fatalf("期望冷却: %+v", st)
+	}
+	if st.Reason != "免费模型额度受限，换号重试" {
+		t.Errorf("reason=%q", st.Reason)
+	}
+	if d := time.Until(st.Until); d > 5*time.Minute {
+		t.Errorf("免费模型失败不应冷却到次日: until=%s 剩余=%s", st.Until, d)
+	}
+
+	// 付费模型：仍按硬冷却（低积分账号报余额不足非免费额度问题）
+	p.ReenableIfCredits("u1", 0) // 复位冷却，并重新标记 lowCredit
+	h.applyUpstreamError(rt, "u1", provider.ErrHardCredit, false)
+	st, _ = p.Status("u1")
+	if st.Reason != "免费额度已用完，次日恢复" {
+		t.Errorf("付费路径 reason=%q", st.Reason)
+	}
+}

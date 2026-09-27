@@ -81,6 +81,27 @@ func main() {
 	go r.TraeWorkScheduler.Run(ctx)
 	go r.QoderScheduler.Run(ctx)
 
+	// 费率/模型定时刷新：启动后先拉一次，之后每小时一次。
+	// 此前只在打开面板「费率/模型」页时按需刷新（缓存为空或超过 1 小时），
+	// 模型上下线、费率变动都无法及时反映到路由判定（模型是否免费 → 低积分账号能否使用）。
+	go func() {
+		refresh := func() {
+			defer func() { _ = recover() }()
+			r.RefreshPricing()
+		}
+		refresh()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				refresh()
+			}
+		}
+	}()
+
 	// 费率接口：/api/fees 与 /api/fees/refresh 需要访问 svc.Runtime 的定价缓存，
 	// 而 server.Handler 只接收 server.Config（不含 Runtime），因此在 serverd 层包装一层路由。
 	fees := http.NewServeMux()
