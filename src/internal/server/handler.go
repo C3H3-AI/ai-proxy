@@ -118,6 +118,12 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("POST /api/accounts/unlock", h.withAuth(h.unlockAccount))
+	h.mux.HandleFunc("POST /api/accounts/enable", h.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		h.setAccountEnabled(w, r, true)
+	}))
+	h.mux.HandleFunc("POST /api/accounts/disable", h.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		h.setAccountEnabled(w, r, false)
+	}))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -248,36 +254,65 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
 }
 
-// unlockAccount 手工解锁低积分账号。body: {"kind":"workbuddy","uid":"..."}
-func (h *Handler) unlockAccount(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Kind string `json:"kind"`
-		UID  string `json:"uid"`
-	}
+// accountReq 账号类管理接口的请求体。
+type accountReq struct {
+	Kind string `json:"kind"`
+	UID  string `json:"uid"`
+}
+
+// accountTarget 解析请求并定位账号；参数非法/账号不存在时已写出错误响应，返回 ok=false。
+func (h *Handler) accountTarget(w http.ResponseWriter, r *http.Request) (*Runtime, string, bool) {
+	var req accountReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
-		return
+		return nil, "", false
 	}
 	if req.Kind == "" || req.UID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "kind and uid are required"})
-		return
+		return nil, "", false
 	}
 	rt := h.cfg.Runtimes[provider.Kind(req.Kind)]
 	if rt == nil || rt.Pool == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not configured: " + req.Kind})
-		return
+		return nil, "", false
 	}
 	if _, ok := rt.Pool.Status(req.UID); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found: " + req.UID})
+		return nil, "", false
+	}
+	return rt, req.UID, true
+}
+
+// unlockAccount 手工解锁低积分账号。body: {"kind":"workbuddy","uid":"..."}
+func (h *Handler) unlockAccount(w http.ResponseWriter, r *http.Request) {
+	rt, uid, ok := h.accountTarget(w, r)
+	if !ok {
 		return
 	}
-	st, _ := rt.Pool.Status(req.UID)
+	st, _ := rt.Pool.Status(uid)
 	if st.Disabled {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "account is permanently disabled, cannot unlock"})
 		return
 	}
-	rt.Pool.Unlock(req.UID)
-	st, _ = rt.Pool.Status(req.UID)
+	rt.Pool.Unlock(uid)
+	st, _ = rt.Pool.Status(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
+}
+
+// setAccountEnabled 面板手工启用/禁用账号。body: {"kind":"workbuddy","uid":"..."}
+// 必须由 serverd 常驻进程执行：账号禁用标记同时存在于内存池与 state.json，
+// ctl 子进程只改文件、serverd 不知道，其下一次落盘会把文件覆盖回旧值，
+// 表现为「解禁了又禁用」。这里直接改内存池并由其落盘，保证两者一致。
+func (h *Handler) setAccountEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	rt, uid, ok := h.accountTarget(w, r)
+	if !ok {
+		return
+	}
+	if !rt.Pool.SetEnabled(uid, enabled) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found: " + uid})
+		return
+	}
+	st, _ := rt.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
 }
 

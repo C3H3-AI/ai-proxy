@@ -181,6 +181,51 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	}
 }
 
+// TestAccountEnableDisableEndpoint 面板启用/禁用必须作用在 serverd 的内存池上，
+// 且与 state.json 同步；否则会出现「解禁了又禁用」。
+func TestAccountEnableDisableEndpoint(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.Disable("u1", "test disable")
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+
+	do := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", path, strings.NewReader(`{"kind":"workbuddy","uid":"u1"}`)))
+		return rec
+	}
+
+	if p.Pick() != nil {
+		t.Fatalf("disabled account should not be picked")
+	}
+	if rec := do("/api/accounts/enable"); rec.Code != 200 {
+		t.Fatalf("enable code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if st, _ := p.Status("u1"); st.Disabled || st.Cooling || st.Reason != "" {
+		t.Fatalf("account should be enabled: %+v", st)
+	}
+	if p.Pick() == nil {
+		t.Fatalf("enabled account should be picked")
+	}
+	if rec := do("/api/accounts/disable"); rec.Code != 200 {
+		t.Fatalf("disable code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if st, _ := p.Status("u1"); !st.Disabled {
+		t.Fatalf("account should be disabled: %+v", st)
+	}
+	if rec := do("/api/accounts/enable"); rec.Code != 200 {
+		t.Fatalf("re-enable code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if st, _ := p.Status("u1"); st.Disabled {
+		t.Fatalf("account should stay enabled after re-enable: %+v", st)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/accounts/enable", strings.NewReader(`{"kind":"workbuddy","uid":"nope"}`)))
+	if rec.Code != 404 {
+		t.Fatalf("unknown uid code=%d", rec.Code)
+	}
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)

@@ -344,6 +344,59 @@ def ctl(mode, platform="", uid=""):
         return None, "ctl 输出非 JSON: %s" % out[:200]
 
 
+def srvd_request(path, payload=None, timeout=60):
+    """调用 serverd 常驻进程的 HTTP 接口（带 api_key）。返回 (data, err)。"""
+    api_key = load_options().get("api_key") or ""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    body, method = None, "GET"
+    if payload is not None:
+        body, method = json.dumps(payload).encode("utf-8"), "POST"
+    try:
+        req = urllib.request.Request(SRVD_UPSTREAM + path, data=body, headers=headers, method=method)
+        raw = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+        return (json.loads(raw) if raw.strip() else {}), None
+    except urllib.error.HTTPError as e:
+        detail = (e.read() or b"")[:200].decode("utf-8", "replace")
+        return None, "serverd %s %s" % (e.code, detail)
+    except Exception as e:
+        return None, "serverd 不可用: %s" % e
+
+
+# 账号池的权威状态在 serverd 常驻进程内存里。state.json 可能被短命 ctl 子进程
+# 写入而滞后，所以枚举账号时用 serverd 的实时状态覆盖这几个字段，
+# 避免面板显示「已启用」但 serverd 仍按禁用跳过该账号（解禁了又禁用）。
+_LIVE_FIELDS = ("disabled", "cooling", "low_credit")
+
+
+def merge_live_status(accounts):
+    live, err = srvd_request("/status")
+    if err or not isinstance(live, dict):
+        return accounts
+    index = {}
+    for kind, items in (live.get("accounts") or {}).items():
+        for it in items or []:
+            index[(kind, it.get("uid"))] = it
+    for a in accounts:
+        it = index.get((a.get("kind"), a.get("uid")))
+        if not it:
+            continue
+        for f in _LIVE_FIELDS:
+            if f in it:
+                a[f] = it[f]
+        a["reason"] = it.get("reason", "")
+        if it.get("until"):
+            a["until"] = it["until"]
+        else:
+            a.pop("until", None)
+    return accounts
+
+
+# 面板账号操作的提示语。
+_ACTION_VERB = {"enable": "已启用", "disable": "已禁用", "unlock": "已解锁"}
+
+
 # ---------------------------------------------------------------------------
 # 账号数据（经 ctl accounts）
 # ---------------------------------------------------------------------------
@@ -358,6 +411,8 @@ def overview_data():
     accounts, err = list_accounts()
     if err:
         accounts = []
+    else:
+        merge_live_status(accounts)
     total = len(accounts)
     wb = [a for a in accounts if a["kind"] == "workbuddy"]
     tr = [a for a in accounts if a["kind"] == "traework"]
@@ -847,7 +902,7 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         if err:
             self._send_json({"error": err, "accounts": []}, 500)
             return
-        self._send_json({"accounts": accounts})
+        self._send_json({"accounts": merge_live_status(accounts)})
 
     def _handle_models(self):
         # 后端注入 API Key 后再代理到 serverd /v1/models（避免前端无鉴权导致 401）
@@ -1106,7 +1161,21 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         body = read_body(self)
         platform = body.get("platform") or body.get("p") or ""
         uid = body.get("uid") or ""
-        data, err = ctl(action, platform, uid)
+        # enable/disable/unlock 改的是账号池状态，必须由 serverd 常驻进程执行：
+        # 走 ctl 只会写 state.json，serverd 内存态不变，随后其落盘又会覆盖回去，
+        # 表现为「解禁了又禁用」。serverd 不可用时才回退 ctl（重启加载项后生效）。
+        if action in _ACTION_VERB and uid:
+            data, err = srvd_request("/api/accounts/" + action, {"kind": platform or "workbuddy", "uid": uid})
+            if err:
+                data, err = ctl(action, platform, uid)
+            else:
+                self._send_json({"success": True, "results": [{
+                    "ok": True, "kind": platform or "workbuddy", "uid": uid,
+                    "msg": _ACTION_VERB[action],
+                }]})
+                return
+        else:
+            data, err = ctl(action, platform, uid)
         if err:
             self._send_json({"error": err, "results": []}, 500)
             return
