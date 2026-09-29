@@ -12,7 +12,7 @@ import (
 // TestChatRequestBodyTooLarge —— 回归：请求体超限必须明确回 413（issue #30 同款）。
 //
 // 修复前用 io.LimitReader(r.Body, 8<<20) **静默截断**：
-// 超过 8MiB 的请求被砍成非法 JSON，解析失败后误报成 invalid_model，
+// 超过上限的请求被砍成非法 JSON，解析失败后误报成 invalid_model，
 // 把"请求太大"误导成"模型名格式不对"，排查时极难定位。
 func TestChatRequestBodyTooLarge(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
@@ -23,7 +23,7 @@ func TestChatRequestBodyTooLarge(t *testing.T) {
 		Upstream: up,
 	})
 
-	// 构造超过 8MiB 的合法 JSON 请求体
+	// 构造超过上限（32MiB）的合法 JSON 请求体
 	pad := strings.Repeat("x", MaxRequestBody) // 单字段就超过上限
 	big := `{"model":"workbuddy/glm-5.2","messages":[{"role":"user","content":"` + pad + `"}]}`
 
@@ -99,9 +99,12 @@ func TestChatMalformedJSONExplicitError(t *testing.T) {
 	}
 }
 
-// TestMaxRequestBodyConstant —— 锁定上限常量口径（8MiB，与上游一致）。
+// TestMaxRequestBodyConstant —— 锁定上限常量口径（32MiB，与上游一致）。
+//
+// 8MiB 会误伤多模态大图（base64 膨胀 33% 后仅够约 6MB 原图），
+// 故对齐上游取 32MiB（可容纳约 24MB 原图）。
 func TestMaxRequestBodyConstant(t *testing.T) {
-	if MaxRequestBody != 8<<20 {
-		t.Errorf("MaxRequestBody=%d want %d (8MiB)", MaxRequestBody, 8<<20)
+	if MaxRequestBody != 32<<20 {
+		t.Errorf("MaxRequestBody=%d want %d (32MiB)", MaxRequestBody, 32<<20)
 	}
 }

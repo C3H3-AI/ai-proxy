@@ -470,12 +470,16 @@ func (h *Handler) modelRate(kind provider.Kind, model string) float64 {
 	return -1
 }
 
-// MaxRequestBody 请求体上限（与上游 wild-work issue #30 一致的 8MiB 口径）。
+// MaxRequestBody 请求体上限。
 //
 // 超限必须**明确回 413**，不能静默截断：截断后 JSON 不再合法，
 // 解析失败会误报成 invalid_model（把"请求太大"指向模型名格式），
-// 排查时极具误导性。
-const MaxRequestBody = 8 << 20
+// 排查时极具误导性（上游 wild-work issue #30）。
+//
+// 口径 32MiB（对齐上游 0bf1f4c）：多模态大图 base64 后膨胀约 33%，
+// 8MiB 仅够约 6MB 原图 —— 会误伤正常的图片请求。
+// 32MiB 可容纳约 24MB 原图，更符合多模态场景。
+const MaxRequestBody = 32 << 20
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 先探一次是否超限，超限直接 413 —— 不做截断。
@@ -757,8 +761,56 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, err
 	}
+	// 修补工具轮的空 content（见 normalizeToolTurnContent）后再覆盖 model。
+	normalizeToolTurnContent(obj)
 	obj["model"] = model
 	return json.Marshal(obj)
+}
+
+// normalizeToolTurnContent 把「content 为 null 或缺失」的工具轮消息补成空串。
+//
+// 上游要求带 tool_calls 的 assistant 消息必须携带**字符串** content；
+// null 或字段缺失会让它**整请求拒答**，并且给一个完全误导的错：
+//
+//	Messages with role 'tool' must be a response to a preceding message with 'tool_calls'
+//
+// 实际与 tool 配对无关（对齐上游 wild-work 1b38ac1 / PR #51 的实测）。
+//
+// 危害在于**中毒进历史**：模型某轮只回工具调用、没有正文时，客户端会把该
+// assistant 消息的 content 落成 null，之后这一轮永远留在 messages 里 ——
+// 于是该会话的**每一发**请求都被上游拒，重启客户端也不恢复，只能新建会话。
+//
+// 客户端侧看到的是 200 + 无 choices 的错误帧（表现为"空流"），
+// 排查方向会被带偏到 tool 配对上。
+func normalizeToolTurnContent(obj map[string]any) {
+	msgs, _ := obj["messages"].([]any)
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		switch role {
+		case "assistant":
+			// 只在真的带 tool_calls 时补：
+			// 普通 assistant 消息 content=null 无证据会出问题，不擅自改写。
+			if tc, ok := m["tool_calls"].([]any); !ok || len(tc) == 0 {
+				continue
+			}
+			if v, exists := m["content"]; !exists || v == nil {
+				m["content"] = ""
+			} else if _, isStr := v.(string); !isStr {
+				m["content"] = ""
+			}
+		case "tool":
+			// 工具返回空内容时客户端同样可能给 null，上游是同一套校验。
+			if v, exists := m["content"]; !exists || v == nil {
+				m["content"] = ""
+			} else if _, isStr := v.(string); !isStr {
+				m["content"] = ""
+			}
+		}
+	}
 }
 
 func (h *Handler) runtimeKinds() []provider.Kind {
