@@ -406,6 +406,23 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 		return nil
 	}
 	infos, err := rt.Upstream.FetchModels(acct)
+	if err != nil {
+		// 401 自愈（对齐上游 wild-work 7dac299）：
+		// 取模型用的这个账号 token 可能刚好过期，此时**先刷新再重试一次**，
+		// 而不是直接判失败。否则模型/费率列表会长时间拿不到
+		// —— 且失败会被记进 lastFail，导致后续 modelsFetchFailCooldown
+		// 内一律返回空（表现为"费率表冷启动消失"）。
+		var ue *provider.Error
+		if errors.As(err, &ue) && ue.Kind == provider.ErrSessionDead {
+			log.Printf("fetch models got 401 uid=%s，尝试刷新 token 后重试", acct.UID)
+			if rerr := rt.Upstream.RefreshToken(acct); rerr == nil {
+				_ = acct.SaveAtomic()
+				infos, err = rt.Upstream.FetchModels(acct)
+			} else {
+				log.Printf("fetch models refresh failed uid=%s err=%v", acct.UID, rerr)
+			}
+		}
+	}
 	if err != nil || len(infos) == 0 {
 		now := time.Now()
 		rt.mu.Lock()
@@ -415,6 +432,11 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 			dynamicModelsCache.Lock()
 			dynamicModelsCache.lastFail = now
 			dynamicModelsCache.Unlock()
+		}
+		if err != nil {
+			// 显式日志：此前失败完全静默，运维无法区分
+			// 「上游没返回模型」与「token 失效」。
+			log.Printf("fetch models failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
 		}
 		return nil
 	}
@@ -448,17 +470,36 @@ func (h *Handler) modelRate(kind provider.Kind, model string) float64 {
 	return -1
 }
 
+// MaxRequestBody 请求体上限（与上游 wild-work issue #30 一致的 8MiB 口径）。
+//
+// 超限必须**明确回 413**，不能静默截断：截断后 JSON 不再合法，
+// 解析失败会误报成 invalid_model（把"请求太大"指向模型名格式），
+// 排查时极具误导性。
+const MaxRequestBody = 8 << 20
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	// 先探一次是否超限，超限直接 413 —— 不做截断。
+	//
+	// 用 LimitReader 多读 1 字节判断是否越界：读到 N+1 说明实际超过 N。
+	probe := make([]byte, MaxRequestBody+1)
+	n, _ := io.ReadFull(r.Body, probe)
+	if n > MaxRequestBody {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body exceeds %d bytes", MaxRequestBody))
 		return
 	}
+	body := probe[:n]
 	var peek struct {
 		Model  string `json:"model"`
 		Stream bool   `json:"stream"`
 	}
-	_ = json.Unmarshal(body, &peek)
+	// JSON 解析失败必须显式报出，不能静默吞掉后拿空 model 去做路由
+	// （否则会把"请求体坏了"误报成 invalid_model）。
+	if err := json.Unmarshal(body, &peek); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"malformed JSON body: "+err.Error())
+		return
+	}
 	rt, model, err := h.runtimeForModel(peek.Model)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_model", err.Error())
@@ -623,6 +664,11 @@ func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrK
 		log.Printf("upstream content blocked uid=%s（内容策略拦截，与账号无关，不罚账号）", uid)
 	case provider.ErrPromptTooLong:
 		log.Printf("upstream prompt too long uid=%s（上下文超限，请求级错误，不罚账号）", uid)
+	case provider.ErrPassthrough:
+		// 模型级限流（issue #53）：账号本身健康，只是当前模型暂不可用。
+		// 不冷却账号，让客户端按 Retry-After 自退避或换模型 ——
+		// 若在此冷却账号，该账号其它可用模型会被一起拖垮。
+		log.Printf("upstream model-level rate limit uid=%s（请求级透传，不罚账号）", uid)
 	case provider.ErrBadParams:
 		log.Printf("upstream bad params uid=%s（请求体问题，不罚账号）", uid)
 

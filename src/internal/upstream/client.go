@@ -41,6 +41,7 @@ const (
 	ErrWafBlock     = provider.ErrWafBlock     // 403 + 非业务信封
 	ErrAccountFault = provider.ErrAccountFault // 11140 / 14017
 	ErrModelBlocked = provider.ErrModelBlocked // 11102 无此模型
+	ErrPassthrough  = provider.ErrPassthrough  // 模型级限流 → 请求级透传，不冷却账号
 )
 
 // Error 带分类的上游错误。
@@ -102,6 +103,16 @@ func Classify(status int, body string) ErrKind {
 	}
 
 	if status == http.StatusTooManyRequests {
+		// issue #53：上游按**模型**限流（body 含 "switch to the other models"）
+		// 是请求级问题 —— 该账号其它模型仍能正常服务。
+		// 若归为 ErrSoftRate 会冷却整个账号，把其它模型一起拖垮。
+		// 判为 ErrPassthrough：透传原文让客户端按 Retry-After 退避或换模型。
+		//
+		// 注意判据仅限该文案（上游 workbuddyai 的实测形态），
+		// 其它 429 语义仍是账号级限流，保持 ErrSoftRate。
+		if strings.Contains(lower, "switch to the other models") {
+			return ErrPassthrough
+		}
 		return ErrSoftRate
 	}
 	if status == http.StatusNotFound {
