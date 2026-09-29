@@ -1455,6 +1455,9 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
    <button class="btn btn-warn" onclick="runAll('checkin','')">全部签到</button>
    <button class="btn btn-pri" onclick="runAll('credits','')">全部刷新积分</button>
    <button class="btn btn-info" onclick="runAll('refresh','')">全部刷新Token</button>
+   <button class="btn btn-ok" onclick="runAll('enable','')" title="把所有被禁用/冷却/低积分的账号恢复参与轮转">全部启用</button>
+   <button class="btn btn-warn" onclick="runAll('unlock','')" title="批量解除低积分限制或冷却（永久禁用的账号不可解锁，需重新登录）">全部解锁</button>
+   <button class="btn btn-err" onclick="runAll('disable','')" title="暂停所有账号参与轮转（可再「全部启用」恢复）">全部禁用</button>
  </div><span class="hint" id="acctCount">账号：加载中…</span></div>
  <div class="box">
    <div class="subhead">WorkBuddy（CodeBuddy）</div>
@@ -1603,6 +1606,33 @@ if(kb){kb.innerHTML=(isIngress?('<div class="hint" style="margin:0 0 8px;color:v
 +'<div class="hint" style="margin-top:6px">客户端（OpenAI 兼容）填 Base URL 时加 <code>/v1</code>，模型名必须带来源前缀：<code>workbuddy/</code>、<code>traework/</code> 或 <code>qoder/</code>。</div>';}
 scheduleOv(!force);}
 function scheduleOv(c){if(ovTimer)clearTimeout(ovTimer);if(c)ovTimer=setTimeout(()=>loadOverview(false),6000);}
+// 面板自动刷新：此前只有一次 6s 延时（且仅首次触发），之后必须手动点，
+// 导致积分/费率长期停留在旧值。改为按当前 tab 周期轮询。
+//
+// 频率：概览/账号 30s（积分变化慢，太频繁会反复打上游）；模型页 60s。
+// 页面不可见时停止轮询（省资源，也避免后台持续请求上游）。
+var pollTimer=null,pollMs=30000;
+function currentTab(){var t=document.querySelector('.tab.active');return t?t.dataset.p:'';}
+function refreshNow(){
+  if(document.hidden)return;
+  var p=currentTab();
+  if(p==='overview')loadOverview(false);
+  else if(p==='accounts')loadAccounts();
+  else if(p==='models'){if(typeof loadModels==='function')loadModels();if(typeof loadFees==='function')loadFees();}
+}
+function startPoll(){
+  if(pollTimer)clearInterval(pollTimer);
+  pollMs=(currentTab()==='models')?60000:30000;
+  pollTimer=setInterval(refreshNow,pollMs);
+}
+// 切 tab 时重置节奏（模型页更低频）
+var _switchPanel=typeof switchPanel==='function'?switchPanel:null;
+if(_switchPanel){switchPanel=function(n){_switchPanel(n);startPoll();refreshNow();};}
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden){if(pollTimer)clearInterval(pollTimer);pollTimer=null;}
+  else{startPoll();refreshNow();}
+});
+startPoll();
 async function loadAccounts(){const d=await api('accounts');const wbB=document.getElementById('wbBody'),trB=document.getElementById('trBody'),qdB=document.getElementById('qdBody'),empty=document.getElementById('acctEmpty'),cnt=document.getElementById('acctCount');if(d.error){toast(d.error,'err');return;}
 const accs=d.accounts||[];const wb=accs.filter(a=>a.kind==='workbuddy'),tr=accs.filter(a=>a.kind==='traework'),qd=accs.filter(a=>a.kind==='qoder');
 const isQ=a=>a.kind==='qoder';
@@ -1617,7 +1647,9 @@ wbB.innerHTML=wb.map(row).join('');trB.innerHTML=tr.map(row).join('');qdB.innerH
 empty.style.display=(wb.length+tr.length+qd.length)?'none':'block';
 cnt.textContent='账号：WorkBuddy '+wb.length+' / TraeWork '+tr.length+' / Qoder '+qd.length+' 个';}
 async function acctAction(action,kind,uid){if(action==='disable'&&!confirm('确认禁用该账号？禁用后暂停参与轮转，可随时点「启用」恢复。'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{platform:kind,uid:uid}});showBatch(d);setTimeout(loadAccounts,1200);}
-async function runAll(action,uid){if(!confirm('确定要对所有账号执行吗？'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{uid:''}});showBatch(d);setTimeout(loadAccounts,1300);}
+async function runAll(action,uid){
+ var tip={checkin:'确定要对所有账号执行【签到】吗？',credits:'确定要刷新所有账号的【积分】吗？',refresh:'确定要刷新所有账号的【Token】吗？',enable:'确定要【启用】所有账号吗？',unlock:'确定要【解锁】所有账号吗？（永久禁用账号不可解锁，需重新登录）',disable:'确定要【禁用】所有账号吗？禁用后全部暂停参与轮转，可点「全部启用」恢复'}[action]||('确定要对所有账号执行 '+action+' 吗？');
+ if(!confirm(tip))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{uid:''}});showBatch(d);setTimeout(loadAccounts,1300);}
 function showBatch(d){if(d.error){toast(d.error,'err');return;}const rs=d.results||[];if(!rs.length){toast(d.message||'完成','ok');return;}rs.forEach(r=>toast((r.ok?'✓ ':'✗ ')+'['+(r.kind||'')+'] '+r.uid+'：'+r.msg,r.ok?'ok':'err'));}
 function copyAcctValue(el,val){if(!el||val===undefined||val===null)return;navigator.clipboard&&navigator.clipboard.writeText(String(val)).then(()=>toast('已复制','ok')).catch(()=>toast('复制失败','err'));}
 async function delAcct(kind,uid){const accs=(await api('accounts')).accounts||[];const a=accs.find(x=>x.kind===kind&&x.uid===uid);const nm=(a&&a.nickname)||uid;if(!confirm('确认删除账号「'+(nm||uid)+'」？\n删除后该账号将不再参与轮转，且需要重新登录才能恢复。'))return;const d=await api('delete',{method:'POST',body:{platform:kind,uid:uid}});toast(d.success?d.message:d.error,d.success?'ok':'err');setTimeout(loadAccounts,1500);}
