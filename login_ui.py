@@ -1351,6 +1351,47 @@ body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,
 .tab{background:transparent;border:1px solid transparent;color:var(--sub);padding:9px 16px;font-size:14px;cursor:pointer;border-radius:8px 8px 0 0;display:inline-flex;gap:6px;align-items:center}
 .tab:hover{color:var(--txt)}
 .tab.active{color:var(--pri);border-color:var(--line);border-bottom-color:var(--pri);background:rgba(10,132,255,.06)}
+/* ── 视觉打磨（在既有 token 体系上增强，不改动原有布局逻辑）────────── */
+/* 排版层级：标题与正文拉开对比，信息密度更高但不拥挤 */
+.brand h1{font-size:22px;letter-spacing:.3px;font-weight:650}
+.brand .sub{font-size:12px;color:var(--sub);margin-top:2px}
+/* 卡片：加轻微阴影与圆角层次，从平面变立体 */
+.box,.stat{border-radius:14px;box-shadow:0 1px 2px rgba(0,0,0,.18),0 8px 24px -12px rgba(0,0,0,.35)}
+.box{padding:18px}
+.stat{padding:16px;transition:transform .15s ease,border-color .15s ease}
+.stat:hover{transform:translateY(-2px);border-color:var(--pri)}
+.stat .val{font-size:24px;letter-spacing:.5px}
+/* 表格：行高与分隔更清晰，hover 更明显 */
+table{border-collapse:separate;border-spacing:0}
+th{position:sticky;top:0;z-index:2;background:var(--card2);font-size:11px;letter-spacing:.4px;text-transform:uppercase}
+td{vertical-align:middle;padding:11px 10px}
+tr:hover td{background:rgba(10,132,255,.045)}
+/* 徽章：更圆润 + 字重，状态一眼可辨 */
+.badge{border-radius:7px;padding:3px 9px;font-weight:600;font-size:11px;letter-spacing:.2px}
+.b-ok{background:rgba(50,215,75,.16);color:var(--ok)}
+.b-warn{background:rgba(255,159,10,.16);color:var(--warn)}
+.b-bad{background:rgba(255,69,58,.16);color:var(--err)}
+/* 按钮：统一圆角与过渡，点击反馈更明确 */
+.btn{border-radius:9px;font-weight:600;transition:filter .15s ease,transform .1s ease}
+.btn:hover{filter:brightness(1.12)}
+.btn:active{transform:scale(.97)}
+.btn.sm{padding:5px 11px;border-radius:8px}
+/* 空状态：居中留白，避免"贴边"的廉价感 */
+.empty{padding:40px 20px;color:var(--sub);font-size:13px;text-align:center}
+/* 滚动条：暗色适配（Chromium） */
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#333a46;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#414a58}
+/* 小屏：表格横向滚动，避免挤压变形 */
+@media(max-width:720px){
+  .wrap{padding:14px}
+  .brand h1{font-size:19px}
+  .box{padding:14px}
+  table{font-size:12px}
+  th,td{padding:9px 7px}
+  .rowbtns{flex-wrap:wrap}
+}
 .panel{display:none}.panel.active{display:block}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:16px}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
@@ -1579,7 +1620,23 @@ function fmtRate(m){
 function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='settings')loadSettings();}
 function refreshAll(){loadOverview(true);loadAccounts();}
 function fmtT(v){if(!v)return '—';const t=new Date(v*1000);if(isNaN(t))return String(v);return t.toLocaleString('zh-CN',{hour12:false});}
-function stateBadge(a){if(a.disabled)return '<span class="badge b-bad">已禁用</span>';if(a.low_credit)return '<span class="badge b-warn">低积分</span><div class="hint">仅限 0 费率模型</div>';if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');return '<span class="badge b-ok">可用</span>';}
+// stateBadge 渲染账号状态徽章 + 原因说明。
+//
+// 后端早就输出 reason（如 "session dead" / "refresh session dead" / "手工禁用"），
+// 但前端此前【完全没用】，一律显示"已禁用" —— 用户看不出为什么被禁，
+// 也不知道 session 失效时「启用」是无效的（会陷入启用→又被禁的循环）。
+function stateBadge(a){
+  if(a.disabled){
+    const dead=isSessionDead(a.reason);
+    const label=dead?'已禁用·需重新登录':'已禁用';
+    return '<span class="badge b-bad">'+label+'</span>'
+      +(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'')
+      +(dead?'<div class="hint" style="color:var(--warn)">启用无效，请删除后重新登录</div>':'');
+  }
+  if(a.low_credit)return '<span class="badge b-warn">低积分</span><div class="hint">仅限 0 费率模型</div>';
+  if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');
+  return '<span class="badge b-ok">可用</span>';
+}
 function tokenCell(a){let h='<span class="badge" style="background:rgba(255,255,255,.06);color:var(--sub)">无刷新令牌</span>';if(a.has_refresh){const left=(a.expires_at||0)-(Date.now()/1000);h=left<=0?'<span class="badge b-bad">已过期</span>':(left<86400?'<span class="badge b-warn">即将过期</span>':'<span class="badge b-info">正常</span>');}return fmtT(a.expires_at)+'<div class="hint">'+h+'</div>';}
 async function loadOverview(force){const d=await api('overview');if(d.error){toast(d.error,'err');return;}const dot=document.getElementById('srvDot'),txt=document.getElementById('srvTxt');dot.className='dot '+(d.server_up?'up':'down');txt.textContent=d.server_up?'运行中':'已停止';
 const u=document.getElementById('loginUser');if(u){u.textContent='已登录: '+esc(d.webui_user||'admin');u.style.display='inline-block';}
@@ -1633,6 +1690,13 @@ document.addEventListener('visibilitychange',function(){
   else{startPoll();refreshNow();}
 });
 startPoll();
+// isSessionDead 判断禁用原因是否为「登录态失效」。
+//
+// 这类账号的 token 已彻底失效：面板「启用」只是清掉 disabled 标记，
+// 下次请求仍会 401 再次被禁用 —— 用户会陷入「启用→又被禁」的死循环。
+// 正确做法是删除后重新登录，UI 必须据此引导而不是给一个无效的「启用」按钮。
+function isSessionDead(r){return /session|12153|token|refresh/i.test(String(r||''));}
+function disabledTip(r){return isSessionDead(r)?'登录态已失效，「启用」无效，请删除后重新登录':'手工禁用，可点「启用」恢复';}
 async function loadAccounts(){const d=await api('accounts');const wbB=document.getElementById('wbBody'),trB=document.getElementById('trBody'),qdB=document.getElementById('qdBody'),empty=document.getElementById('acctEmpty'),cnt=document.getElementById('acctCount');if(d.error){toast(d.error,'err');return;}
 const accs=d.accounts||[];const wb=accs.filter(a=>a.kind==='workbuddy'),tr=accs.filter(a=>a.kind==='traework'),qd=accs.filter(a=>a.kind==='qoder');
 const isQ=a=>a.kind==='qoder';
@@ -1641,7 +1705,10 @@ const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hin
 '<button class="btn sm btn-pri" onclick="acctAction(&#39;credits&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新积分</button>'+
 '<button class="btn sm btn-info" onclick="acctAction(&#39;refresh&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新Token</button>'+
 ((!a.disabled&&(a.low_credit||a.cooling))?('<button class="btn sm btn-warn" title="解除低积分限制或冷却，立即恢复参与轮转" onclick="acctAction(&#39;unlock&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">'+(a.low_credit?'解锁':'解禁')+'</button>'):'')+
-(a.disabled?('<button class="btn sm btn-ok" title="重新启用该账号，参与轮转" onclick="acctAction(&#39;enable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">启用</button>'):('<button class="btn sm btn-warn" title="手工禁用该账号，暂停参与轮转（可再启用）" onclick="acctAction(&#39;disable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">禁用</button>'))+
+(a.disabled?(isSessionDead(a.reason)
+   ?('<span class="badge b-bad" title="'+esc(disabledTip(a.reason))+'">需重新登录</span><button class="btn sm btn-err" title="删除后重新扫码登录（登录态已失效，启用无效）" onclick="delAcct(&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">重新登录</button>')
+   :('<button class="btn sm btn-ok" title="'+esc(disabledTip(a.reason))+'" onclick="acctAction(&#39;enable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">启用</button>')
+ ):('<button class="btn sm btn-warn" title="手工禁用该账号，暂停参与轮转（可再启用）" onclick="acctAction(&#39;disable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">禁用</button>'))+
 '<button class="btn sm btn-danger" onclick="delAcct(&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">删除</button></div></td></tr>';
 wbB.innerHTML=wb.map(row).join('');trB.innerHTML=tr.map(row).join('');qdB.innerHTML=qd.map(row).join('');
 empty.style.display=(wb.length+tr.length+qd.length)?'none':'block';
