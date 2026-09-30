@@ -36,6 +36,19 @@ type Client struct {
 	// 供 Aggregate/Stream 覆盖响应中的 model 字段（上游恒为 auto）。
 	lastModelMu sync.RWMutex
 	lastModel   string
+
+	// slots 按账号限制「同时发往上游的聊天请求数」。
+	//
+	// 上游对每个账号有并发准入窗口，超出会以业务码 10605 拒绝
+	// （实测：并发升高时返回 10605，而不是排队）。
+	// 本服务是多账号池，若不限制单账号并发，一次突发就会打满窗口，
+	// 随后所有请求都收到 10605 —— 而 10605 若被当成账号级错误冷却，
+	// 会把一个本来健康的账号拖进冷却（与 #53「模型级限流不拖垮账号」同型问题）。
+	//
+	// 默认为 1（保守，与上游观察一致）；可通过 SetMaxConcurrency 调整。
+	slotsMu   sync.Mutex
+	slots     map[string]chan struct{}
+	maxConcur int
 }
 
 // New 生产默认。Qoder gateway 对 HTTP/2 不友好（stream INTERNAL_ERROR），强制 HTTP/1.1。
@@ -51,11 +64,59 @@ func NewWithTimeout(timeout time.Duration) *Client {
 		IdleConnTimeout:     90 * time.Second,
 		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
 	}
-	return &Client{
-		HTTP:    &http.Client{Timeout: timeout, Transport: tr},
-		Base:    OpenAPIBase,
-		Gateway: GatewayBase,
+	c := &Client{
+		HTTP:      &http.Client{Timeout: timeout, Transport: tr},
+		Base:      OpenAPIBase,
+		Gateway:   GatewayBase,
+		slots:     make(map[string]chan struct{}),
+		maxConcur: DefaultMaxConcurrency,
 	}
+	return c
+}
+
+// DefaultMaxConcurrency 单账号同时发往上游的聊天请求数上限（默认 1）。
+//
+// 取 1 的依据：上游对每个账号有并发准入窗口，超出会回业务码 10605 直接拒绝而非排队。
+// 保守取值可避免触发拒绝；需要更高吞吐时可调用 SetMaxConcurrency 调大，
+// 但超过账号窗口反而会因 10605 降低成功率。
+const DefaultMaxConcurrency = 1
+
+// SetMaxConcurrency 设置单账号并发上限（<=0 时回落为 DefaultMaxConcurrency）。
+// 仅影响之后新建的账号槽位，已存在的槽位保持原容量。
+func (c *Client) SetMaxConcurrency(n int) {
+	c.slotsMu.Lock()
+	defer c.slotsMu.Unlock()
+	if n <= 0 {
+		n = DefaultMaxConcurrency
+	}
+	c.maxConcur = n
+}
+
+// slotFor 返回该账号的并发槽位（不存在则按当前上限创建）。
+func (c *Client) slotFor(uid string) chan struct{} {
+	c.slotsMu.Lock()
+	defer c.slotsMu.Unlock()
+	if c.slots == nil {
+		c.slots = make(map[string]chan struct{})
+	}
+	ch, ok := c.slots[uid]
+	if !ok {
+		n := c.maxConcur
+		if n <= 0 {
+			n = DefaultMaxConcurrency
+		}
+		ch = make(chan struct{}, n)
+		c.slots[uid] = ch
+	}
+	return ch
+}
+
+// acquireSlot 占用该账号一个上游并发位；返回的 release 必须被调用（用 defer）。
+// 达到上限时阻塞等待，而不是让上游回 10605 后被动重试。
+func (c *Client) acquireSlot(uid string) func() {
+	ch := c.slotFor(uid)
+	ch <- struct{}{}
+	return func() { <-ch }
 }
 
 // NewWithBase 测试用：覆盖 base/gateway。
@@ -248,6 +309,10 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	}
 	encoded := qoderEncode(rawBody)
 	url := c.gatewayBase() + EpChat
+	// 占用该账号的上游并发位：达到上限时本地排队，避免上游回 10605 后被动重试。
+	release := c.acquireSlot(a.UID)
+	defer release()
+
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(encoded))
 	if err != nil {
 		return nil, 0, nil, err
@@ -408,6 +473,15 @@ func Classify(status int, body string) provider.ErrKind {
 	}
 	if status == http.StatusTooManyRequests {
 		return provider.ErrSoftRate
+	}
+	// 10605：上游按账号的并发准入窗口拒绝（"concurrency limit" 类）。
+	//
+	// 这是**请求级**而非账号故障：账号本身健康，只是此刻并发打满。
+	// 若归为 ErrSoftRate 会冷却整个账号，把一个健康账号拖进冷却 ——
+	// 与 #53「模型级限流不拖垮账号」同型问题。
+	// 判为 ErrPassthrough：不罚账号，由调用方重试或换号。
+	if strings.Contains(body, "10605") {
+		return provider.ErrPassthrough
 	}
 	if status == http.StatusNotFound {
 		return provider.ErrNotFound
