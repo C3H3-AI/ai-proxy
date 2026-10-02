@@ -42,6 +42,11 @@ const (
 	ErrAccountFault = provider.ErrAccountFault // 11140 / 14017
 	ErrModelBlocked = provider.ErrModelBlocked // 11102 无此模型
 	ErrPassthrough  = provider.ErrPassthrough  // 模型级限流 → 请求级透传，不冷却账号
+	// defaultTokenTTL 上游未返回 expiresIn 时使用的默认有效期。
+	//
+	// 取值 24h：远大于请求前的预刷新窗口（10 分钟），
+	// 既不会再"每次请求都刷新"，也不会像保留旧值那样让 ExpiresAt 卡死在过去。
+	defaultTokenTTL = 24 * time.Hour
 )
 
 // Error 带分类的上游错误。
@@ -340,9 +345,21 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if tok.Domain != "" {
 		a.Domain = tok.Domain
 	}
-	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
+	// 过期时间：优先用上游给的 expiresIn。
+	//
+	// 上游若【持续不返回】expiresIn（实测个别账号如此），单纯保留旧值会让
+	// ExpiresAt 永久卡在一个已过去的时间点：
+	//   - 面板一直显示那个过期时刻（用户看到"token 即将过期"却怎么刷都不变）；
+	//   - NeedsRefresh 恒为 true → 每次请求都触发刷新（反而造成刷新风暴，
+	//     与 preserveExpiry 原本的意图相悖）。
+	//
+	// 故这里改为：有 expiresIn 就用；缺失则按默认有效期顺延，并打日志提示。
 	if tok.ExpiresIn > 0 {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	} else {
+		log.Printf("workbuddy refresh: uid=%s 响应缺 expiresIn，按默认 %v 顺延过期时间",
+			a.UID, defaultTokenTTL)
+		a.ExpiresAt = time.Now().Add(defaultTokenTTL).Unix()
 	}
 	log.Printf("workbuddy refresh success uid=%s refresh_rotated=%t expires_at=%d", a.UID, a.RefreshToken != oldRefresh, a.ExpiresAt)
 	return nil
