@@ -1731,7 +1731,26 @@ function stateBadge(a){
   if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');
   return '<span class="badge b-ok">可用</span>';
 }
-function tokenCell(a){let h='<span class="badge" style="background:rgba(255,255,255,.06);color:var(--sub)">无刷新令牌</span>';if(a.has_refresh){const left=(a.expires_at||0)-(Date.now()/1000);h=left<=0?'<span class="badge b-bad">已过期</span>':(left<86400?'<span class="badge b-warn">即将过期</span>':'<span class="badge b-info">正常</span>');}return fmtT(a.expires_at)+'<div class="hint">'+h+'</div>';}
+// tokenCell 渲染 token 过期状态。
+//
+// ⚠️ 阈值修复：原用 left<86400(24h) 判"即将过期"，
+// 但上游对不同账号给的 expiresIn 差异很大（实测：多数账号 30~55 天，
+// 个别账号仅约 10 小时）。短有效期账号一刷新完就落在 24h 内，
+// 会【恒定显示"即将过期"】，让人误以为账号有问题（实际它在正常服务）。
+//
+// 改法：只有真正临期（<1h）才告警；24h 内且短有效期显示为"短效"，
+// 避免把上游的策略差异误报成故障。
+function tokenCell(a){
+  let h='<span class="badge" style="background:rgba(255,255,255,.06);color:var(--sub)">无刷新令牌</span>';
+  if(a.has_refresh){
+    const left=(a.expires_at||0)-(Date.now()/1000);
+    if(left<=0) h='<span class="badge b-bad">已过期</span>';
+    else if(left<3600) h='<span class="badge b-warn">即将过期</span>';
+    else if(left<86400) h='<span class="badge b-mut" title="上游对该账号签发的 token 有效期较短（约十余小时），刷新后会自动续期">短效</span>';
+    else h='<span class="badge b-info">正常</span>';
+  }
+  return fmtT(a.expires_at)+'<div class="hint">'+h+'</div>';
+}
 async function loadOverview(force){const d=await api('overview');if(d.error){toast(d.error,'err');return;}const dot=document.getElementById('srvDot'),txt=document.getElementById('srvTxt');dot.className='dot '+(d.server_up?'up':'down');txt.textContent=d.server_up?'运行中':'已停止';
 const u=document.getElementById('loginUser');if(u){u.textContent='已登录: '+esc(d.webui_user||'admin');u.style.display='inline-block';}
 const cards=[
@@ -1812,7 +1831,7 @@ function disabledTip(r){
 async function loadAccounts(){const d=await api('accounts');const wbB=document.getElementById('wbBody'),trB=document.getElementById('trBody'),qdB=document.getElementById('qdBody'),empty=document.getElementById('acctEmpty'),cnt=document.getElementById('acctCount');if(d.error){toast(d.error,'err');return;}
 const accs=d.accounts||[];const wb=accs.filter(a=>a.kind==='workbuddy'),tr=accs.filter(a=>a.kind==='traework'),qd=accs.filter(a=>a.kind==='qoder');
 const isQ=a=>a.kind==='qoder';
-const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hint">'+esc(a.uid)+'<button class="btn sm btn-ok" title="复制 UID" onclick="copyAcctValue(this,'+JSON.stringify(String(a.uid))+')">复制</button></td><td><b>'+(a.credits||0).toLocaleString()+'</b></td><td>'+stateBadge(a)+'</td><td>'+tokenCell(a)+'</td><td><div class="rowbtns">'+
+const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hint">'+esc(a.uid)+'<button class="btn sm btn-ok" title="复制 UID" onclick="copyAcctValue(this,&#39;'+esc(a.uid)+'&#39;)">复制</button></td><td><b>'+(a.credits||0).toLocaleString()+'</b></td><td>'+stateBadge(a)+'</td><td>'+tokenCell(a)+'</td><td><div class="rowbtns">'+
 (isQ(a)?'':('<button class="btn sm btn-ok" onclick="acctAction(&#39;checkin&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">签到</button>'))+
 '<button class="btn sm btn-pri" onclick="acctAction(&#39;credits&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新积分</button>'+
 '<button class="btn sm btn-info" onclick="acctAction(&#39;refresh&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新Token</button>'+
