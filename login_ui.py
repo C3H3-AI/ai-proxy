@@ -1784,13 +1784,31 @@ document.addEventListener('visibilitychange',function(){
   else{startPoll();refreshNow();}
 });
 startPoll();
-// isSessionDead 判断禁用原因是否为「登录态失效」。
+// isSessionDead 判断禁用原因是否为「登录态失效」（token 彻底不可用）。
 //
 // 这类账号的 token 已彻底失效：面板「启用」只是清掉 disabled 标记，
 // 下次请求仍会 401 再次被禁用 —— 用户会陷入「启用→又被禁」的死循环。
 // 正确做法是删除后重新登录，UI 必须据此引导而不是给一个无效的「启用」按钮。
-function isSessionDead(r){return /session|12153|token|refresh/i.test(String(r||''));}
-function disabledTip(r){return isSessionDead(r)?'登录态已失效，「启用」无效，请删除后重新登录':'手工禁用，可点「启用」恢复';}
+//
+// ⚠️ 判据必须【严格】：此前用 /session|12153|token|refresh/ 过宽，
+// 会把 "429 rate limit"、"refresh: xxx"（限流/刷新失败，可恢复）
+// 也误判成"需重新登录"，导致用户以为账号没救了而误删（真实事故）。
+//
+// 只有以下明确形态才算 session 死亡：
+//   - "session dead" / "refresh session dead"（后端 Disable 的 reason）
+//   - 12153（上游 offline session 业务码）
+//   - TOKEN_EXPIRE（Qoder 的明确过期标记）
+function isSessionDead(r){
+  const s=String(r||'');
+  return /session\s*dead/i.test(s) || /\b12153\b/.test(s) || /TOKEN_EXPIRE/i.test(s);
+}
+function disabledTip(r){
+  return isSessionDead(r)
+    ? '登录态已失效，「启用」无效，请删除后重新登录'
+    : (String(r||'').match(/429|rate limit|限流/i)
+        ? '上游限流/冷却中，可点「启用」或稍后自动恢复'
+        : '手工禁用，可点「启用」恢复');
+}
 async function loadAccounts(){const d=await api('accounts');const wbB=document.getElementById('wbBody'),trB=document.getElementById('trBody'),qdB=document.getElementById('qdBody'),empty=document.getElementById('acctEmpty'),cnt=document.getElementById('acctCount');if(d.error){toast(d.error,'err');return;}
 const accs=d.accounts||[];const wb=accs.filter(a=>a.kind==='workbuddy'),tr=accs.filter(a=>a.kind==='traework'),qd=accs.filter(a=>a.kind==='qoder');
 const isQ=a=>a.kind==='qoder';
