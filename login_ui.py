@@ -1525,6 +1525,28 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
 @keyframes rise{from{opacity:0; transform:translateY(9px)} to{opacity:1; transform:none}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important}}
 
+/* ── 布局与组件（视觉重构时漏掉、从旧版取回）─────────────────
+   ⚠️ 事故：重构时整块替换 CSS，以下类未被新块覆盖，导致
+   tab 内容全部同时显示（.panel 的 display 规则丢失）。
+   这里补齐，并统一使用新的琥珀/墨蓝 token。 ────────────── */
+.panel{display:none}
+.panel.active{display:block}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.tbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.tbar .grp{display:flex;gap:8px;flex-wrap:wrap}
+.rowbtns{display:flex;gap:5px;flex-wrap:wrap}
+.subhead{font-size:13px;color:var(--pri);margin:18px 0 8px;font-weight:600}
+.rate{color:var(--pri);font-weight:600;white-space:nowrap}
+.connrow{display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:12px;line-height:1.6}
+.connrow code{flex:0 0 76px;color:var(--pri)}
+.connrow .cpy{word-break:break-all;cursor:pointer;color:var(--txt)}
+.connrow .cpy:hover{color:var(--pri)}
+.fsec{margin-bottom:18px}
+.fsec h3{font-size:13px;color:var(--sub);margin:0 0 8px;border-bottom:1px solid var(--line);padding-bottom:6px}
+.qr{background:#fff;border-radius:10px;padding:12px;display:inline-block;text-align:center}
+.qr img{max-width:200px;border-radius:6px}
+.qr .ph{color:#999;font-size:13px}
+
 /* ── 滚动条 ── */
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-track{background:transparent}
