@@ -13,6 +13,7 @@
 package main
 
 import (
+	"errors"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -294,6 +295,40 @@ func checkinOne(sch *scheduler.Scheduler, uid string) scheduler.CheckinResult {
 }
 
 // ---------- refresh ----------
+// humanizeRefreshError 把刷新失败的底层错误翻译成可操作的中文提示。
+//
+// 背景（真实困惑）：原始错误是形如
+//   upstream session_dead (http 401): {"code":12153,"msg":"12153:refresh token
+//   failed:400 Bad Request: invalid_grant: Token is not active",...}
+// 的英文长串，用户（包括维护者）看不懂，也不知道该"重新登录"还是"等一会儿"。
+//
+// 这里按 provider.ErrKind 分类给出明确动作建议；无法识别时保留原文，
+// 不吞掉信息（排查仍需要原始报文）。
+func humanizeRefreshError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var ue *provider.Error
+	if errors.As(err, &ue) {
+		switch ue.Kind {
+		case provider.ErrSessionDead:
+			return "登录态已失效（session dead），请删除该账号后重新登录"
+		case provider.ErrHardCredit:
+			return "账号余额/权益不足，请充值或次日再试"
+		case provider.ErrSoftRate:
+			return "上游限流（429），请稍后自动重试或换个时间再试"
+		case provider.ErrPassthrough:
+			return "上游并发打满，已本地排队，请稍后重试"
+		case provider.ErrAccountFault:
+			return "账号授权/配额异常（需重新授权或换号）"
+		case provider.ErrServer:
+			return "上游服务暂时故障，请稍后重试"
+		}
+	}
+	// 保留原始错误以便排查，但前置一句人话
+	return "刷新失败：" + err.Error()
+}
+
 func collectRefresh(r *svc.Runtime, ks []provider.Kind, uid string) []outCredit {
 	var out []outCredit
 	for _, k := range kinds {
@@ -313,7 +348,7 @@ func collectRefresh(r *svc.Runtime, ks []provider.Kind, uid string) []outCredit 
 			}
 			err := up.RefreshToken(a)
 			if err != nil {
-				o.Msg = err.Error()
+				o.Msg = humanizeRefreshError(err)
 			} else if err := a.SaveAtomic(); err != nil {
 				o.Msg = "refresh save: " + err.Error()
 			} else {
