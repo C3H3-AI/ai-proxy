@@ -1,0 +1,141 @@
+name: Sync to Backup Repo
+
+# 主线发布新版本（config.yaml 的 version bump）时，把代码同步到备用仓库。
+#
+# 背景：
+#   - 主线   C3H3-AI/ai-proxy（有真实用户）
+#   - 备用   c3h3-ci/ai-proxy（仅作镜像，保持同步）
+#   - 两仓库**历史独立**（此前迁移时改过 SHA），因此不能简单 merge，
+#     必须"用主线文件内容覆盖备用仓库"，否则 GitHub 会以
+#     "no history in common" 拒绝建 PR。
+#
+# 触发与 release.yml 保持一致（push master 且 config.yaml 变更），
+# 这样"发版本 → 自动同步"自然串起来。
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'config.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 未配置 secret 时跳过（例如 fork 环境），不使工作流失败
+    if: ${{ github.repository == 'C3H3-AI/ai-proxy' }}
+    steps:
+      - name: Checkout mainline
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: ver
+        run: |
+          V=$(grep -m1 '^version:' config.yaml | sed 's/version: *//; s/"//g')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "主线版本: $V"
+
+      - name: Prepare backup content (rewrite to backup identity)
+        run: |
+          set -euo pipefail
+          # 备用仓库保留自己的地址，仅改这几处
+          sed -i 's#url: "https://github.com/C3H3-AI/ai-proxy"#url: "https://github.com/c3h3-ci/ai-proxy"#' config.yaml
+          sed -i 's#image: "ghcr.io/c3h3-ai/ai-proxy"#image: "ghcr.io/c3h3-ci/ai-proxy"#' config.yaml
+          sed -i 's#registry-prefix: ghcr.io/c3h3-ai#registry-prefix: ghcr.io/c3h3-ci#g' .github/workflows/build-image.yml
+          sed -i 's#IMAGE="ghcr.io/c3h3-ai/\${IMAGE_NAME}"#IMAGE="ghcr.io/c3h3-ci/\${IMAGE_NAME}"#' .github/workflows/build-image.yml
+          if [ -f repository.yaml ]; then
+            sed -i 's#https://github.com/C3H3-AI/ai-proxy#https://github.com/c3h3-ci/ai-proxy#' repository.yaml
+            sed -i 's#maintainer: C3H3-AI#maintainer: c3h3-ci#' repository.yaml
+          fi
+          echo "--- 同步后的 identity ---"
+          grep -m1 '^version:' config.yaml
+          grep -m1 '^url:' config.yaml
+          grep -m1 '^image:' config.yaml
+          grep -m1 'registry-prefix:' .github/workflows/build-image.yml
+
+      - name: Clone backup repo
+        env:
+          TOKEN: ${{ secrets.BACKUP_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::未配置 BACKUP_SYNC_TOKEN，跳过同步"
+            echo "skip=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          rm -rf /tmp/backup
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/c3h3-ci/ai-proxy.git" /tmp/backup
+          cd /tmp/backup
+          git config user.name  "c3h3-ci"
+          git config user.email "deploy@homediy.top"
+          echo "skip=false" >> "$GITHUB_ENV"
+
+      - name: Overwrite backup with mainline content
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          cd /tmp/backup
+          # 删除除 .git 外所有内容，再拷入主线文件（保留备用仓库的历史，保证有共同祖先）
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          cp -a "${GITHUB_WORKSPACE}/." .
+          rm -rf .git.keep 2>/dev/null || true
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无差异，无需同步"
+            echo "changed=false" >> "$GITHUB_ENV"
+          else
+            git commit -q -F - <<MSG
+          chore: 同步主线 C3H3-AI 的 ${{ steps.ver.outputs.version }}
+
+          自动同步（Sync to Backup Repo workflow）。
+          备用仓库保留自身 identity（url / image / registry-prefix），
+          其余代码与主线一致。
+          MSG
+            echo "changed=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Push branch and open PR on backup
+        if: env.skip != 'true' && env.changed == 'true'
+        env:
+          TOKEN: ${{ secrets.BACKUP_SYNC_TOKEN }}
+          GH_TOKEN: ${{ secrets.BACKUP_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd /tmp/backup
+          BR="sync/${{ steps.ver.outputs.version }}"
+          git push -f origin "HEAD:refs/heads/$BR"
+
+          # 备用仓库 main 有分支保护 → 必须走 PR
+          EXIST=$(gh pr list --repo c3h3-ci/ai-proxy --head "$BR" --state open --json number --jq '.[0].number' || true)
+          if [ -n "${EXIST:-}" ]; then
+            echo "已存在 PR #$EXIST，跳过创建"
+          else
+            gh pr create \
+              --repo c3h3-ci/ai-proxy \
+              --base main \
+              --head "$BR" \
+              --title "chore: 同步主线 C3H3-AI 的 ${{ steps.ver.outputs.version }}" \
+              --body "由主线 Sync to Backup Repo workflow 自动创建。
+
+          同步主线 \`C3H3-AI/ai-proxy\` 的 \`${{ steps.ver.outputs.version }}\`。
+          备用仓库保留自身 identity（url / image / registry-prefix），其余代码与主线一致。
+
+          两仓库历史独立，故为内容同步（非 merge）。"
+          fi
+
+      - name: Try auto-merge (needs PR merge permission)
+        if: env.skip != 'true' && env.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_SYNC_TOKEN }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          BR="sync/${{ steps.ver.outputs.version }}"
+          PR=$(gh pr list --repo c3h3-ci/ai-proxy --head "$BR" --state open --json number --jq '.[0].number')
+          [ -z "${PR:-}" ] && { echo "无待合并 PR"; exit 0; }
+          gh pr merge "$PR" --repo c3h3-ci/ai-proxy --merge
+          echo "已自动合并 PR #$PR"
