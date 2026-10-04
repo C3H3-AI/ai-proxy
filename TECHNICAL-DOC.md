@@ -330,7 +330,7 @@ Web UI 为单文件内嵌 HTML（暗色主题），含概览/账号/模型/设�
 ## 11. 部署形态
 
 - **形态**：HA addon（Supervisor 托管）。`config.yaml` 含 `hassio_api`/`ingress`/`panel_icon` 等字段。
-- **构建**：GitHub Actions + HA 官方 builder actions 预构建多架构镜像推 GHCR（`ghcr.io/c3h3-ci/ai-proxy`），Supervisor 直接拉取；Dockerfile 多阶段：golang:1.25-alpine 编译 5 个二进制 → alpine:3.20 运行时（bash/curl/jq/python3/ca-certificates/tzdata）。
+- **构建**：GitHub Actions + HA 官方 builder actions 预构建多架构镜像推 GHCR（`ghcr.io/c3h3-ai/ai-proxy`），Supervisor 直接拉取；Dockerfile 多阶段：golang:1.25-alpine 编译 5 个二进制 → alpine:3.20 运行时（bash/curl/jq/python3/ca-certificates/tzdata）。
 - **启动**：`run.sh` → `python3 login_ui.py`（PID 1）→ 拉起 `serverd`。
 - **持久化**：`/data/auths`（凭证，rw）、`/data/data`（state.json、options.json、config.json）。
 - **健康检查**：`wget http://127.0.0.1:7863/healthz`。
