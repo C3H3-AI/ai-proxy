@@ -47,6 +47,12 @@ const (
 	ErrWafBlock     // 403 + 非业务信封（WAF 拦截页/空体）→ 账号软冷却
 	ErrAccountFault // 账号级授权/配额故障（11140 / 14017）→ 冷却轮换
 	ErrModelBlocked // 11102 该后端无此模型 → 按 (账号,模型) 避让
+
+	// ErrPassthrough 请求级错误：透传原文给客户端，**不冷却账号**。
+	// 用于「上游按模型限流」（issue #53）：此时账号本身健康，
+	// 只是当前模型暂时不可用；若按账号级 ErrSoftRate 冷却，
+	// 会把该账号其它还能用的模型一起拖进冷却。
+	ErrPassthrough
 )
 
 func (k ErrKind) String() string {
@@ -75,6 +81,8 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrModelBlocked:
 		return "model_blocked"
+	case ErrPassthrough:
+		return "passthrough"
 	default:
 		return "none"
 	}
@@ -90,7 +98,7 @@ func (k ErrKind) String() string {
 // 对它们调用 NoteError 会把健康账号冷却掉，并浪费其他账号的请求配额。
 func (k ErrKind) PenalizesAccount() bool {
 	switch k {
-	case ErrContentBlocked, ErrPromptTooLong, ErrBadParams:
+	case ErrContentBlocked, ErrPromptTooLong, ErrBadParams, ErrPassthrough:
 		return false
 	default:
 		return true

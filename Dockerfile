@@ -39,7 +39,7 @@ LABEL \
     io.hass.type="addon" \
     io.hass.name="AI Proxy" \
     io.hass.description="WorkBuddy + TraeWork 多账号 OpenAI 兼容代理" \
-    io.hass.url="https://github.com/C3H3-AI/ai-proxy"
+    io.hass.url="https://github.com/c3h3-ci/ai-proxy"
 
 RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apk/repositories
 

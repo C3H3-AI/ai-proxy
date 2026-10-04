@@ -114,14 +114,19 @@ func TestStreamHeadersSet(t *testing.T) {
 	}
 }
 
-// TestStreamEmptyBody —— 空流不得 panic，应正常收尾。
+// TestStreamEmptyBody —— 空流不得 panic；收尾补 [DONE] 让客户端能结束，
+// 但必须返回错误（上游 issue #42 同款修法），以便调用方冷却该账号。
+//
+// 旧断言「空流不应报错」修复前的行为：那时空流被伪装成成功，
+// 账号不会被冷却 → 后续请求继续选中一个实际无响应的账号。
 func TestStreamEmptyBody(t *testing.T) {
 	rec := httptest.NewRecorder()
-	if err := Stream(rec, strings.NewReader("")); err != nil {
-		t.Fatalf("空流不应报错: %v", err)
+	err := Stream(rec, strings.NewReader(""))
+	if err == nil {
+		t.Fatal("空流应返回错误（否则账号不会被冷却）")
 	}
 	if !strings.Contains(rec.Body.String(), "data: [DONE]") {
-		t.Errorf("空流应收尾为 [DONE]: %q", rec.Body.String())
+		t.Errorf("空流仍应补 [DONE] 让客户端收尾: %q", rec.Body.String())
 	}
 }
 

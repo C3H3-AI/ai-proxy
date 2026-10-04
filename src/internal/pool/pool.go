@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"log"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -122,6 +123,23 @@ func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[a.UID]; ok {
+		// 凭证被替换（通常是用户重新登录）→ 自动解除禁用。
+		//
+		// 背景（真实事故）：账号 session 死亡被 Disable 后，用户重新登录覆盖 auth 文件，
+		// 但 state.json 里的 disabled 标记仍在，面板一直显示"启用无效"、
+		// 引导用户删除重来 —— 其实凭证已经是新的、完全可用。
+		//
+		// 这里只在 accessToken **真的变了** 时才解除，避免每次目录扫描都无谓重置状态。
+		//
+		// 解除后若 token 其实仍失效，下一次请求/刷新会失败并重新 Disable —— 不会掩盖问题，
+		// 而是让状态自愈到正确值。
+		if e.a != nil && a != nil && e.a.AccessToken != a.AccessToken && e.disabled {
+			log.Printf("pool: uid=%s 凭证已更新（重新登录），自动解除禁用（原原因：%s）", a.UID, e.reason)
+			e.disabled = false
+			e.reason = ""
+			e.until = time.Time{}
+			e.errCount = 0
+		}
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}

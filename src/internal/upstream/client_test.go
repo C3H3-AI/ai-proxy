@@ -82,7 +82,14 @@ func TestRefreshSuccess(t *testing.T) {
 	}
 }
 
-func TestRefreshPreservesExpiryWhenOmitted(t *testing.T) {
+// TestRefreshAdvancesExpiryWhenOmitted —— 上游未返回 expiresIn 时的过期时间处理。
+//
+// 旧行为（"保留旧值"）已被判定为缺陷并修正：保留旧值会让 ExpiresAt
+// 永久卡在一个已过去的时间点，导致面板一直显示那个过期时刻、
+// 且 NeedsRefresh 恒为 true 引发刷新风暴。
+//
+// 现行为：按 defaultTokenTTL 顺延，保证过期时间始终向前推进。
+func TestRefreshAdvancesExpiryWhenOmitted(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat"}}`), nil
 	})
@@ -90,8 +97,15 @@ func TestRefreshPreservesExpiryWhenOmitted(t *testing.T) {
 	if err := c.RefreshToken(a); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if a.ExpiresAt != 1753600000 {
-		t.Errorf("expiresAt should be preserved, got %d", a.ExpiresAt)
+	if a.ExpiresAt == 1753600000 {
+		t.Errorf("expiresAt 不应保留旧值（会卡死在面板上），got %d", a.ExpiresAt)
+	}
+	if a.ExpiresAt <= time.Now().Unix() {
+		t.Errorf("expiresAt 应顺延到未来，got %d", a.ExpiresAt)
+	}
+	want := time.Now().Unix() + int64(defaultTokenTTL/time.Second)
+	if a.ExpiresAt < want-5 || a.ExpiresAt > want+5 {
+		t.Errorf("expiresAt=%d want≈%d (默认 TTL)", a.ExpiresAt, want)
 	}
 	if a.RefreshToken != "rt" {
 		t.Errorf("refreshToken should be preserved, got %s", a.RefreshToken)

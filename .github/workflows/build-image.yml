@@ -63,11 +63,13 @@ jobs:
         with:
           architectures: ${{ env.ARCHITECTURES }}
           image-name: ${{ env.IMAGE_NAME }}
-          # 必须显式传小写前缀。该 action 默认取 github.repository_owner，
-          # 而本仓库 owner 是 "C3H3-AI"（含大写），GHCR 会拒绝：
-          #   invalid tag "ghcr.io/C3H3-AI/amd64-ai-proxy:1.1.0b13":
+          # 显式传 registry 前缀（而不是依赖 action 默认取 repository_owner）。
+          # GHCR 要求 repository name 全小写，owner 一旦含大写就会失败：
+          #   invalid tag "ghcr.io/Owner/amd64-ai-proxy:1.1.0b13":
           #   repository name must be lowercase
-          registry-prefix: ghcr.io/c3h3-ai
+          # 当前 owner（c3h3-ci）本身已是小写，显式传仍然更稳妥：
+          # 迁移/改名时只需改这一处，不必等 CI 报错才发现。
+          registry-prefix: ghcr.io/c3h3-ci
 
   build:
     name: Build ${{ matrix.arch }}
@@ -109,7 +111,7 @@ jobs:
           architectures: ${{ env.ARCHITECTURES }}
           container-registry-password: ${{ secrets.GITHUB_TOKEN }}
           image-name: ${{ env.IMAGE_NAME }}
-          registry-prefix: ghcr.io/c3h3-ai
+          registry-prefix: ghcr.io/c3h3-ci
           image-tags: |
             ${{ needs.init.outputs.version }}
             latest
@@ -125,9 +127,8 @@ jobs:
       - name: Verify manifest tag matches config.yaml version
         run: |
           set -euo pipefail
-          # 小写硬编码，与 build/manifest 两个 job 的 registry-prefix 保持一致
-          # （owner 是 C3H3-AI，GHCR 不接受大写）
-          IMAGE="ghcr.io/c3h3-ai/${IMAGE_NAME}"
+          # 与 build/manifest 两个 job 的 registry-prefix 保持一致
+          IMAGE="ghcr.io/c3h3-ci/${IMAGE_NAME}"
           VERSION="${{ needs.init.outputs.version }}"
           echo "Checking ${IMAGE}:${VERSION}"
           if ! docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
