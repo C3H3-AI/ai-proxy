@@ -7,7 +7,7 @@ printf '.mimosa/\ntrae-tokens-local/\ndeploy_commit.sh\ncommit_restore.sh\nrebui
 git add -A
 echo "=== 提交前检查（应无 .mimosa / trae-tokens-local）==="
 git diff --cached --name-only | grep -E 'mimosa|trae-tokens|commit_restore|rebuild_commit' && { echo "仍有垃圾文件，中止"; exit 1; }
-git -c user.name="C3H3-AI" -c user.email="deploy@homediy.top" commit -q -m "feat: 恢复 b3-b12 全部改动 — 设置统一WebUI/安全加固/禁用启用/cheapest改名/虚拟模型/自动保存白名单 (1.1.0b13)"
+git -c user.name="c3h3-ci" -c user.email="deploy@homediy.top" commit -q -m "feat: 恢复 b3-b12 全部改动 — 设置统一WebUI/安全加固/禁用启用/cheapest改名/虚拟模型/自动保存白名单 (1.1.0b13)"
 git push --force origin master 2>&1 | tail -1
 echo "=== 最终提交文件数与抽查 ==="
 git show --stat HEAD | tail -3

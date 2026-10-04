@@ -118,6 +118,12 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("POST /api/accounts/unlock", h.withAuth(h.unlockAccount))
+	h.mux.HandleFunc("POST /api/accounts/enable", h.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		h.setAccountEnabled(w, r, true)
+	}))
+	h.mux.HandleFunc("POST /api/accounts/disable", h.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		h.setAccountEnabled(w, r, false)
+	}))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -248,36 +254,65 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
 }
 
-// unlockAccount 手工解锁低积分账号。body: {"kind":"workbuddy","uid":"..."}
-func (h *Handler) unlockAccount(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Kind string `json:"kind"`
-		UID  string `json:"uid"`
-	}
+// accountReq 账号类管理接口的请求体。
+type accountReq struct {
+	Kind string `json:"kind"`
+	UID  string `json:"uid"`
+}
+
+// accountTarget 解析请求并定位账号；参数非法/账号不存在时已写出错误响应，返回 ok=false。
+func (h *Handler) accountTarget(w http.ResponseWriter, r *http.Request) (*Runtime, string, bool) {
+	var req accountReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body: " + err.Error()})
-		return
+		return nil, "", false
 	}
 	if req.Kind == "" || req.UID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "kind and uid are required"})
-		return
+		return nil, "", false
 	}
 	rt := h.cfg.Runtimes[provider.Kind(req.Kind)]
 	if rt == nil || rt.Pool == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "provider not configured: " + req.Kind})
-		return
+		return nil, "", false
 	}
 	if _, ok := rt.Pool.Status(req.UID); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found: " + req.UID})
+		return nil, "", false
+	}
+	return rt, req.UID, true
+}
+
+// unlockAccount 手工解锁低积分账号。body: {"kind":"workbuddy","uid":"..."}
+func (h *Handler) unlockAccount(w http.ResponseWriter, r *http.Request) {
+	rt, uid, ok := h.accountTarget(w, r)
+	if !ok {
 		return
 	}
-	st, _ := rt.Pool.Status(req.UID)
+	st, _ := rt.Pool.Status(uid)
 	if st.Disabled {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "account is permanently disabled, cannot unlock"})
 		return
 	}
-	rt.Pool.Unlock(req.UID)
-	st, _ = rt.Pool.Status(req.UID)
+	rt.Pool.Unlock(uid)
+	st, _ = rt.Pool.Status(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
+}
+
+// setAccountEnabled 面板手工启用/禁用账号。body: {"kind":"workbuddy","uid":"..."}
+// 必须由 serverd 常驻进程执行：账号禁用标记同时存在于内存池与 state.json，
+// ctl 子进程只改文件、serverd 不知道，其下一次落盘会把文件覆盖回旧值，
+// 表现为「解禁了又禁用」。这里直接改内存池并由其落盘，保证两者一致。
+func (h *Handler) setAccountEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	rt, uid, ok := h.accountTarget(w, r)
+	if !ok {
+		return
+	}
+	if !rt.Pool.SetEnabled(uid, enabled) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found: " + uid})
+		return
+	}
+	st, _ := rt.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": st})
 }
 
@@ -371,6 +406,23 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 		return nil
 	}
 	infos, err := rt.Upstream.FetchModels(acct)
+	if err != nil {
+		// 401 自愈（对齐上游 wild-work 7dac299）：
+		// 取模型用的这个账号 token 可能刚好过期，此时**先刷新再重试一次**，
+		// 而不是直接判失败。否则模型/费率列表会长时间拿不到
+		// —— 且失败会被记进 lastFail，导致后续 modelsFetchFailCooldown
+		// 内一律返回空（表现为"费率表冷启动消失"）。
+		var ue *provider.Error
+		if errors.As(err, &ue) && ue.Kind == provider.ErrSessionDead {
+			log.Printf("fetch models got 401 uid=%s，尝试刷新 token 后重试", acct.UID)
+			if rerr := rt.Upstream.RefreshToken(acct); rerr == nil {
+				_ = acct.SaveAtomic()
+				infos, err = rt.Upstream.FetchModels(acct)
+			} else {
+				log.Printf("fetch models refresh failed uid=%s err=%v", acct.UID, rerr)
+			}
+		}
+	}
 	if err != nil || len(infos) == 0 {
 		now := time.Now()
 		rt.mu.Lock()
@@ -380,6 +432,11 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 			dynamicModelsCache.Lock()
 			dynamicModelsCache.lastFail = now
 			dynamicModelsCache.Unlock()
+		}
+		if err != nil {
+			// 显式日志：此前失败完全静默，运维无法区分
+			// 「上游没返回模型」与「token 失效」。
+			log.Printf("fetch models failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
 		}
 		return nil
 	}
@@ -413,17 +470,40 @@ func (h *Handler) modelRate(kind provider.Kind, model string) float64 {
 	return -1
 }
 
+// MaxRequestBody 请求体上限。
+//
+// 超限必须**明确回 413**，不能静默截断：截断后 JSON 不再合法，
+// 解析失败会误报成 invalid_model（把"请求太大"指向模型名格式），
+// 排查时极具误导性（上游 wild-work issue #30）。
+//
+// 口径 32MiB（对齐上游 0bf1f4c）：多模态大图 base64 后膨胀约 33%，
+// 8MiB 仅够约 6MB 原图 —— 会误伤正常的图片请求。
+// 32MiB 可容纳约 24MB 原图，更符合多模态场景。
+const MaxRequestBody = 32 << 20
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	// 先探一次是否超限，超限直接 413 —— 不做截断。
+	//
+	// 用 LimitReader 多读 1 字节判断是否越界：读到 N+1 说明实际超过 N。
+	probe := make([]byte, MaxRequestBody+1)
+	n, _ := io.ReadFull(r.Body, probe)
+	if n > MaxRequestBody {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body exceeds %d bytes", MaxRequestBody))
 		return
 	}
+	body := probe[:n]
 	var peek struct {
 		Model  string `json:"model"`
 		Stream bool   `json:"stream"`
 	}
-	_ = json.Unmarshal(body, &peek)
+	// JSON 解析失败必须显式报出，不能静默吞掉后拿空 model 去做路由
+	// （否则会把"请求体坏了"误报成 invalid_model）。
+	if err := json.Unmarshal(body, &peek); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"malformed JSON body: "+err.Error())
+		return
+	}
 	rt, model, err := h.runtimeForModel(peek.Model)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_model", err.Error())
@@ -495,7 +575,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if status >= 400 {
 			kind := rt.Upstream.Classify(status, string(respBody))
-			h.applyUpstreamError(rt, acct.UID, kind)
+			h.applyUpstreamError(rt, acct.UID, kind, freeModel)
 			h.stickyClear(rt)
 			lastErr = &provider.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			continue
@@ -513,7 +593,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if ue, ok := serr.(*provider.Error); ok {
 					log.Printf("stream error platform=%s uid=%s kind=%s msg=%s",
 						rt.Kind, acct.UID, ue.Kind, ue.Msg)
-					h.applyUpstreamError(rt, acct.UID, ue.Kind)
+					h.applyUpstreamError(rt, acct.UID, ue.Kind, freeModel)
 				} else {
 					log.Printf("stream i/o error platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
 				}
@@ -550,16 +630,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 后者此前会被完全忽略（`_ = Stream(...)`），导致：
 //   1. 账号仍被标记为健康（NoteSuccess 在 Stream 之前调用）；
 //   2. 后续请求继续选中这个实际不可用的账号。
-func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrKind) {
+//
+// freeModel 表示本次请求是否为 0 费率（免费）模型，用于区分「免费额度用完」的
+// 惩罚力度：免费模型失败只需换号重试，不该把账号冷却到次日。
+func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrKind, freeModel bool) {
 	switch kind {
 	case provider.ErrHardCredit:
 		// 依据账号实际状态，而非模型费率，判断是否属于「免费额度已用完」：
-		// 低积分账号即使调用 0 费率模型仍报余额不足 → 禁用到次日自动恢复。
-		if st, ok := rt.Pool.Status(uid); ok && st.LowCredit {
+		// 低积分账号即使调用 0 费率模型仍报余额不足。
+		st, ok := rt.Pool.Status(uid)
+		switch {
+		case ok && st.LowCredit && freeModel:
+			// 低积分账号调免费模型失败：不能冷却到次日 0 点（那会让该账号当天
+			// 连免费模型都彻底吃不到，表现为「0 积分免费的也不能用」）。
+			// 改为短冷却换号重试，稍后仍可重新参与轮转。
+			rt.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "免费模型额度受限，换号重试")
+		case ok && st.LowCredit:
 			now := time.Now()
 			until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
 			rt.Pool.Cooldown(uid, pool.CoolHard, until.Sub(now), "免费额度已用完，次日恢复")
-		} else {
+		default:
 			rt.Pool.Cooldown(uid, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
 		}
 	case provider.ErrSoftRate:
@@ -578,6 +668,11 @@ func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrK
 		log.Printf("upstream content blocked uid=%s（内容策略拦截，与账号无关，不罚账号）", uid)
 	case provider.ErrPromptTooLong:
 		log.Printf("upstream prompt too long uid=%s（上下文超限，请求级错误，不罚账号）", uid)
+	case provider.ErrPassthrough:
+		// 模型级限流（issue #53）：账号本身健康，只是当前模型暂不可用。
+		// 不冷却账号，让客户端按 Retry-After 自退避或换模型 ——
+		// 若在此冷却账号，该账号其它可用模型会被一起拖垮。
+		log.Printf("upstream model-level rate limit uid=%s（请求级透传，不罚账号）", uid)
 	case provider.ErrBadParams:
 		log.Printf("upstream bad params uid=%s（请求体问题，不罚账号）", uid)
 
@@ -666,8 +761,56 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, err
 	}
+	// 修补工具轮的空 content（见 normalizeToolTurnContent）后再覆盖 model。
+	normalizeToolTurnContent(obj)
 	obj["model"] = model
 	return json.Marshal(obj)
+}
+
+// normalizeToolTurnContent 把「content 为 null 或缺失」的工具轮消息补成空串。
+//
+// 上游要求带 tool_calls 的 assistant 消息必须携带**字符串** content；
+// null 或字段缺失会让它**整请求拒答**，并且给一个完全误导的错：
+//
+//	Messages with role 'tool' must be a response to a preceding message with 'tool_calls'
+//
+// 实际与 tool 配对无关（对齐上游 wild-work 1b38ac1 / PR #51 的实测）。
+//
+// 危害在于**中毒进历史**：模型某轮只回工具调用、没有正文时，客户端会把该
+// assistant 消息的 content 落成 null，之后这一轮永远留在 messages 里 ——
+// 于是该会话的**每一发**请求都被上游拒，重启客户端也不恢复，只能新建会话。
+//
+// 客户端侧看到的是 200 + 无 choices 的错误帧（表现为"空流"），
+// 排查方向会被带偏到 tool 配对上。
+func normalizeToolTurnContent(obj map[string]any) {
+	msgs, _ := obj["messages"].([]any)
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		switch role {
+		case "assistant":
+			// 只在真的带 tool_calls 时补：
+			// 普通 assistant 消息 content=null 无证据会出问题，不擅自改写。
+			if tc, ok := m["tool_calls"].([]any); !ok || len(tc) == 0 {
+				continue
+			}
+			if v, exists := m["content"]; !exists || v == nil {
+				m["content"] = ""
+			} else if _, isStr := v.(string); !isStr {
+				m["content"] = ""
+			}
+		case "tool":
+			// 工具返回空内容时客户端同样可能给 null，上游是同一套校验。
+			if v, exists := m["content"]; !exists || v == nil {
+				m["content"] = ""
+			} else if _, isStr := v.(string); !isStr {
+				m["content"] = ""
+			}
+		}
+	}
 }
 
 func (h *Handler) runtimeKinds() []provider.Kind {

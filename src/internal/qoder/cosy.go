@@ -135,7 +135,16 @@ func aesCBCEncrypt(plain, tempKey []byte) ([]byte, error) {
 }
 
 // AuthHeader 计算单次请求的 Authorization 头。
-func (s *CosySession) AuthHeader(body, rawURL, uid string) (string, error) {
+//
+// 返回 (auth, date, err)：date 是**签名所用的**时间戳，调用方必须用它设
+// cosy-date 头，不能再自行取一次 time.Now()。
+//
+// 原因（对齐上游 wild-work 1fbc3f7）：签名串里含 date，上游拿 cosy-date
+// 头重算签名。若两处各自取时间，一旦跨秒就对不上，回
+//   {"code":"101","message":"Signature invalid"}
+// 签名串含整个 body，md5 耗时随 body 增长 —— 长会话（数 MB 上下文）下
+// 达到毫秒级，所以表现为「长会话偶发、body 越大越频繁」，且原样重试常能成功。
+func (s *CosySession) AuthHeader(body, rawURL, uid string) (string, int64, error) {
 	payload := map[string]string{
 		"cosyVersion": "0.1.43",
 		"ideVersion":  "",
@@ -147,20 +156,26 @@ func (s *CosySession) AuthHeader(body, rawURL, uid string) (string, error) {
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	pathSig := strings.TrimPrefix(u.Path, "/algo")
-	date := fmt.Sprintf("%d", time.Now().Unix())
+	// 注入时钟（测试可断言 cosy-date 与签名同源）
+	now := nowUnix()
+	date := fmt.Sprintf("%d", now)
 	sigInput := payloadB64 + "\n" + s.CosyKey + "\n" + date + "\n" + body + "\n" + pathSig
 	sum := md5.Sum([]byte(sigInput))
 	sig := hex.EncodeToString(sum[:])
-	return "Bearer COSY." + payloadB64 + "." + sig, nil
+	return "Bearer COSY." + payloadB64 + "." + sig, now, nil
 }
+
+// nowUnix 取当前 Unix 秒。抽成变量是为了测试可注入「每次取值前进」的时钟，
+// 从而断言 cosy-date 必须与签名所用的时间戳同源。
+var nowUnix = func() int64 { return time.Now().Unix() }
 
 // ApplyHeaders 把 15 个必带头 + 推理附加头全部设置到 req。
 // accept 恒为 text/event-stream（与插件一致）；sse 仅控制 cache-control。
 func (s *CosySession) ApplyHeaders(req *http.Request, body, rawURL, uid string, sse bool, modelKey string) error {
-	auth, err := s.AuthHeader(body, rawURL, uid)
+	auth, sigDate, err := s.AuthHeader(body, rawURL, uid)
 	if err != nil {
 		return err
 	}
@@ -169,7 +184,7 @@ func (s *CosySession) ApplyHeaders(req *http.Request, body, rawURL, uid string, 
 	h.Set("content-type", "application/json")
 	h.Set("cosy-machinetype", s.MachineType)
 	h.Set("cosy-clienttype", "5")
-	h.Set("cosy-date", fmt.Sprintf("%d", time.Now().Unix()))
+	h.Set("cosy-date", fmt.Sprintf("%d", sigDate))
 	h.Set("cosy-user", uid)
 	h.Set("cosy-key", s.CosyKey)
 	h.Set("accept", "text/event-stream")

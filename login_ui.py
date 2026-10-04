@@ -344,6 +344,59 @@ def ctl(mode, platform="", uid=""):
         return None, "ctl 输出非 JSON: %s" % out[:200]
 
 
+def srvd_request(path, payload=None, timeout=60):
+    """调用 serverd 常驻进程的 HTTP 接口（带 api_key）。返回 (data, err)。"""
+    api_key = load_options().get("api_key") or ""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    body, method = None, "GET"
+    if payload is not None:
+        body, method = json.dumps(payload).encode("utf-8"), "POST"
+    try:
+        req = urllib.request.Request(SRVD_UPSTREAM + path, data=body, headers=headers, method=method)
+        raw = urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+        return (json.loads(raw) if raw.strip() else {}), None
+    except urllib.error.HTTPError as e:
+        detail = (e.read() or b"")[:200].decode("utf-8", "replace")
+        return None, "serverd %s %s" % (e.code, detail)
+    except Exception as e:
+        return None, "serverd 不可用: %s" % e
+
+
+# 账号池的权威状态在 serverd 常驻进程内存里。state.json 可能被短命 ctl 子进程
+# 写入而滞后，所以枚举账号时用 serverd 的实时状态覆盖这几个字段，
+# 避免面板显示「已启用」但 serverd 仍按禁用跳过该账号（解禁了又禁用）。
+_LIVE_FIELDS = ("disabled", "cooling", "low_credit")
+
+
+def merge_live_status(accounts):
+    live, err = srvd_request("/status")
+    if err or not isinstance(live, dict):
+        return accounts
+    index = {}
+    for kind, items in (live.get("accounts") or {}).items():
+        for it in items or []:
+            index[(kind, it.get("uid"))] = it
+    for a in accounts:
+        it = index.get((a.get("kind"), a.get("uid")))
+        if not it:
+            continue
+        for f in _LIVE_FIELDS:
+            if f in it:
+                a[f] = it[f]
+        a["reason"] = it.get("reason", "")
+        if it.get("until"):
+            a["until"] = it["until"]
+        else:
+            a.pop("until", None)
+    return accounts
+
+
+# 面板账号操作的提示语。
+_ACTION_VERB = {"enable": "已启用", "disable": "已禁用", "unlock": "已解锁"}
+
+
 # ---------------------------------------------------------------------------
 # 账号数据（经 ctl accounts）
 # ---------------------------------------------------------------------------
@@ -358,6 +411,8 @@ def overview_data():
     accounts, err = list_accounts()
     if err:
         accounts = []
+    else:
+        merge_live_status(accounts)
     total = len(accounts)
     wb = [a for a in accounts if a["kind"] == "workbuddy"]
     tr = [a for a in accounts if a["kind"] == "traework"]
@@ -847,7 +902,7 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         if err:
             self._send_json({"error": err, "accounts": []}, 500)
             return
-        self._send_json({"accounts": accounts})
+        self._send_json({"accounts": merge_live_status(accounts)})
 
     def _handle_models(self):
         # 后端注入 API Key 后再代理到 serverd /v1/models（避免前端无鉴权导致 401）
@@ -1106,7 +1161,21 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
         body = read_body(self)
         platform = body.get("platform") or body.get("p") or ""
         uid = body.get("uid") or ""
-        data, err = ctl(action, platform, uid)
+        # enable/disable/unlock 改的是账号池状态，必须由 serverd 常驻进程执行：
+        # 走 ctl 只会写 state.json，serverd 内存态不变，随后其落盘又会覆盖回去，
+        # 表现为「解禁了又禁用」。serverd 不可用时才回退 ctl（重启加载项后生效）。
+        if action in _ACTION_VERB and uid:
+            data, err = srvd_request("/api/accounts/" + action, {"kind": platform or "workbuddy", "uid": uid})
+            if err:
+                data, err = ctl(action, platform, uid)
+            else:
+                self._send_json({"success": True, "results": [{
+                    "ok": True, "kind": platform or "workbuddy", "uid": uid,
+                    "msg": _ACTION_VERB[action],
+                }]})
+                return
+        else:
+            data, err = ctl(action, platform, uid)
         if err:
             self._send_json({"error": err, "results": []}, 500)
             return
@@ -1266,6 +1335,7 @@ HTML_PAGE = r"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Proxy 管理</title>
 <style>
+/* 基础 token 由下方「仪表盘精密感」体系覆盖（保留仅为无 JS 时的兜底）*/
 :root{--bg:#0f1115;--card:#171a21;--card2:#1d2129;--line:#2a2f3a;--txt:#e6e9ef;--sub:#9aa3b2;--pri:#0a84ff;--pri2:#3395ff;--ok:#32d74b;--warn:#ff9f0a;--err:#ff453a;--info:#a0d7ff;}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif}
@@ -1282,60 +1352,216 @@ body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,
 .tab{background:transparent;border:1px solid transparent;color:var(--sub);padding:9px 16px;font-size:14px;cursor:pointer;border-radius:8px 8px 0 0;display:inline-flex;gap:6px;align-items:center}
 .tab:hover{color:var(--txt)}
 .tab.active{color:var(--pri);border-color:var(--line);border-bottom-color:var(--pri);background:rgba(10,132,255,.06)}
-.panel{display:none}.panel.active{display:block}
+/* ══ 视觉体系：仪表盘精密感（industrial / data-dense）══════════════
+   方向：深邃墨蓝底 + 琥珀强调（避开常见紫蓝渐变），
+   等宽数字对齐、卡片顶部高光（模拟仪表玻璃）、细网格纹理做氛围。
+   全部用系统字体栈：面板经 HA ingress 加载，不能依赖外部字体/CDN。
+   ═══════════════════════════════════════════════════════════════ */
+:root{
+  /* 底：墨蓝黑（比原 #0f1115 更冷、更深） */
+  --bg:#0b0e13; --bg2:#0f131a;
+  --card:#141922; --card2:#1a202b; --card3:#212936;
+  --line:#26303f; --line2:#33404f;
+  --txt:#e8ecf3; --sub:#8b95a6; --dim:#5f6b7d;
+  /* 强调：琥珀（主）+ 青（辅助），克制使用 */
+  --pri:#f0a03c; --pri2:#ffbe6b;
+  --ok:#3ddc84; --warn:#ffb02e; --err:#ff5c5c; --info:#5ec8f2;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Mono",Menlo,Consolas,monospace;
+  --r:10px; --r-sm:7px;
+}
+body{
+  background:
+    radial-gradient(1100px 520px at 12% -8%, rgba(240,160,60,.09), transparent 62%),
+    radial-gradient(820px 420px at 92% 4%, rgba(94,200,242,.06), transparent 60%),
+    linear-gradient(180deg,var(--bg2),var(--bg) 320px);
+  background-attachment:fixed;
+  font-family:-apple-system,"Segoe UI Variable Text","Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:14px; line-height:1.6; color:var(--txt);
+  -webkit-font-smoothing:antialiased;
+}
+/* 细网格纹理（极淡，只在顶部氛围区） */
+.wrap::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background-image:linear-gradient(rgba(255,255,255,.022) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(255,255,255,.022) 1px,transparent 1px);
+  background-size:44px 44px;
+  mask-image:linear-gradient(180deg,rgba(0,0,0,.7),transparent 46%);
+}
+.wrap{position:relative; z-index:1}
+
+/* ── 顶部品牌区 ── */
+.brand h1{
+  font-size:23px; font-weight:680; letter-spacing:-.2px; margin:0;
+  background:linear-gradient(96deg,var(--txt) 30%,var(--pri2));
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+}
+.brand .sub{font-size:12px; color:var(--dim); letter-spacing:.4px}
+.pill{
+  border:1px solid var(--line); border-radius:999px; padding:5px 13px;
+  font-size:11.5px; color:var(--sub); background:rgba(255,255,255,.025);
+  backdrop-filter:blur(6px);
+}
+.dot{box-shadow:0 0 0 3px rgba(61,220,132,.14)}
+.dot.up{background:var(--ok)}
+.dot.down{background:var(--err); box-shadow:0 0 0 3px rgba(255,92,92,.16)}
+
+/* ── 标签页：底边滑动指示 ── */
+.tabs{border-bottom:1px solid var(--line); gap:2px}
+.tab{
+  border-radius:var(--r-sm) var(--r-sm) 0 0; color:var(--dim); font-weight:600;
+  padding:10px 15px; position:relative; transition:color .16s ease,background .16s ease;
+}
+.tab:hover{color:var(--txt); background:rgba(255,255,255,.04)}
+.tab.active{color:var(--pri); background:transparent}
+.tab.active::after{
+  content:""; position:absolute; left:10px; right:10px; bottom:-1px; height:2px;
+  background:linear-gradient(90deg,var(--pri),var(--pri2)); border-radius:2px;
+  animation:tabIn .26s cubic-bezier(.2,.8,.2,1);
+}
+@keyframes tabIn{from{transform:scaleX(.2); opacity:0} to{transform:scaleX(1); opacity:1}}
+
+/* ── 卡片：顶部高光 = 仪表玻璃感 ── */
+.box,.stat{
+  background:linear-gradient(180deg,var(--card2),var(--card));
+  border:1px solid var(--line); border-radius:var(--r);
+  box-shadow:0 1px 0 rgba(255,255,255,.045) inset, 0 10px 26px -14px rgba(0,0,0,.7);
+  position:relative; overflow:hidden;
+}
+.box::before,.stat::before{
+  content:""; position:absolute; top:0; left:0; right:0; height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.10),transparent);
+}
+.box{padding:18px}
+.box h2{font-size:13px; letter-spacing:.6px; text-transform:uppercase; color:var(--sub); margin:0 0 13px}
+
+/* 统计卡：数值等宽 + 琥珀强调 */
+.stat{padding:15px 16px; transition:transform .16s ease,border-color .16s ease}
+.stat:hover{transform:translateY(-2px); border-color:var(--line2)}
+.stat .lbl{font-size:11px; letter-spacing:.5px; text-transform:uppercase; color:var(--dim); margin-bottom:7px}
+.stat .val{
+  font-family:var(--mono); font-size:25px; font-weight:650; letter-spacing:-.5px;
+  font-variant-numeric:tabular-nums; line-height:1.15;
+}
+.val.good{color:var(--ok)} .val.warn{color:var(--warn)} .val.bad{color:var(--err)}
+
+/* ── 表格 ── */
+table{width:100%; border-collapse:separate; border-spacing:0; font-size:13px}
+th{
+  position:sticky; top:0; z-index:2; background:var(--card2);
+  font-size:10.5px; letter-spacing:.7px; text-transform:uppercase; color:var(--dim);
+  font-weight:600; text-align:left; padding:9px 10px;
+  border-bottom:1px solid var(--line); white-space:nowrap;
+}
+td{padding:11px 10px; border-bottom:1px solid rgba(38,48,63,.55); vertical-align:middle}
+tbody tr{transition:background .13s ease}
+tbody tr:hover td{background:rgba(240,160,60,.045)}
+tbody tr:last-child td{border-bottom:none}
+/* 数字列等宽对齐（积分/UID） */
+td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-spacing:-.2px}
+.uid{font-family:var(--mono); font-size:11.5px; color:var(--sub); letter-spacing:-.2px}
+
+/* ── 徽章 ── */
+.badge{
+  border-radius:var(--r-sm); padding:3px 9px; font-weight:650; font-size:11px;
+  letter-spacing:.3px; display:inline-flex; align-items:center; gap:5px;
+  border:1px solid transparent;
+}
+.b-ok{background:rgba(61,220,132,.13); color:var(--ok); border-color:rgba(61,220,132,.26)}
+.b-warn{background:rgba(255,176,46,.13); color:var(--warn); border-color:rgba(255,176,46,.26)}
+.b-bad{background:rgba(255,92,92,.13); color:var(--err); border-color:rgba(255,92,92,.28)}
+.b-mut{background:rgba(255,255,255,.05); color:var(--sub); border-color:var(--line)}
+
+/* ── 按钮 ── */
+.btn{
+  border:none; border-radius:9px; font-weight:650; font-size:12px;
+  padding:7px 12px; cursor:pointer; color:#fff;
+  background:var(--card3); border:1px solid var(--line);
+  transition:transform .1s ease,filter .15s ease,border-color .15s ease;
+}
+.btn:hover{filter:brightness(1.18); border-color:var(--line2)}
+.btn:active{transform:scale(.96)}
+.btn-pri{background:linear-gradient(180deg,var(--pri),#d98a2b); border-color:transparent; color:#241703}
+.btn-ok{background:linear-gradient(180deg,#43e08a,#28b96a); border-color:transparent; color:#062512}
+.btn-warn{background:linear-gradient(180deg,var(--warn),#e0901f); border-color:transparent; color:#2a1a02}
+.btn-info{background:linear-gradient(180deg,#63cdf5,#3aa9d8); border-color:transparent; color:#04222c}
+.btn-err,.btn-danger{background:linear-gradient(180deg,#ff6b6b,#e04b4b); border-color:transparent; color:#2b0707}
+
+/* ── 表单 ── */
+.field input,.field select,.search,textarea{
+  background:var(--bg2); border:1px solid var(--line); color:var(--txt);
+  border-radius:var(--r-sm); padding:8px 11px; font-size:13px; width:100%;
+  transition:border-color .15s ease,box-shadow .15s ease;
+}
+.field input:focus,.field select:focus,.search:focus,textarea:focus{
+  outline:none; border-color:var(--pri); box-shadow:0 0 0 3px rgba(240,160,60,.16);
+}
+.field label{font-size:11px; letter-spacing:.5px; text-transform:uppercase; color:var(--dim)}
+
+/* ── 空状态 ── */
+.empty{padding:44px 20px; text-align:center; color:var(--dim); font-size:13px}
+.empty::before{
+  content:"○"; display:block; font-size:26px; color:var(--line2); margin-bottom:10px;
+}
+
+/* ── Toast ── */
+.toast .t{
+  background:linear-gradient(180deg,var(--card2),var(--card));
+  border:1px solid var(--line); border-radius:var(--r);
+  box-shadow:0 12px 30px -12px rgba(0,0,0,.8);
+  padding:12px 14px; font-size:13px; min-width:260px; max-width:380px;
+}
+
+/* ── 入场：错峰浮现（一次编排，胜过零散微动效）── */
+.wrap>.top,.tabs,.panel.active>.box,.panel.active>.cards>*,.panel.active>.tbar{
+  animation:rise .42s cubic-bezier(.2,.8,.2,1) backwards;
+}
+.wrap>.top{animation-delay:.02s}
+.tabs{animation-delay:.07s}
+.panel.active>.cards>*:nth-child(1){animation-delay:.10s}
+.panel.active>.cards>*:nth-child(2){animation-delay:.14s}
+.panel.active>.cards>*:nth-child(3){animation-delay:.18s}
+.panel.active>.cards>*:nth-child(n+4){animation-delay:.22s}
+.panel.active>.tbar{animation-delay:.20s}
+@keyframes rise{from{opacity:0; transform:translateY(9px)} to{opacity:1; transform:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important}}
+
+/* ── 布局与组件（视觉重构时漏掉、从旧版取回）─────────────────
+   ⚠️ 事故：重构时整块替换 CSS，以下类未被新块覆盖，导致
+   tab 内容全部同时显示（.panel 的 display 规则丢失）。
+   这里补齐，并统一使用新的琥珀/墨蓝 token。 ────────────── */
+.panel{display:none}
+.panel.active{display:block}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-bottom:16px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
-.stat .lbl{font-size:12px;color:var(--sub);margin-bottom:6px}
-.stat .val{font-size:20px;font-weight:700}
-.val.good{color:var(--ok)}.val.warn{color:var(--warn)}.val.bad{color:var(--err)}
-.box{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
-.box h2{font-size:15px;margin:0 0 12px;display:flex;align-items:center;gap:8px}
-.hint{font-size:12px;color:var(--sub);line-height:1.6}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
-th{color:var(--sub);font-weight:500;font-size:12px;white-space:nowrap;background:var(--card2)}
-tr:hover td{background:rgba(255,255,255,.02)}
-.subhead{font-size:13px;color:var(--pri);margin:18px 0 8px;font-weight:600}
-.badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:6px;font-weight:500}
-.b-ok{background:rgba(50,215,75,.15);color:var(--ok)}
-.b-warn{background:rgba(255,159,10,.15);color:var(--warn)}
-.b-bad{background:rgba(255,69,58,.15);color:var(--err)}
-.b-info{background:rgba(160,215,255,.25);color:#0a84ff}
-.rowbtns{display:flex;gap:5px;flex-wrap:wrap}
-.btn{display:inline-flex;align-items:center;gap:5px;border:none;border-radius:7px;padding:6px 10px;font-size:12px;cursor:pointer;color:#fff}
-.btn.sm{padding:4px 8px;font-size:11px}
-.btn-pri{background:var(--pri)}.btn-pri:hover{background:var(--pri2)}
-.btn-ok{background:var(--ok);color:#06210b}.btn-ok:hover{filter:brightness(1.1)}
-.btn-warn{background:var(--warn)}.btn-warn:hover{filter:brightness(1.1)}
-.btn-info{background:var(--info);color:#0f1115}.btn-info:hover{filter:brightness(1.1)}
-.btn-danger{background:var(--err)}.btn-danger:hover{filter:brightness(1.1)}
-.btn:disabled{opacity:.5;cursor:not-allowed}
 .tbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
 .tbar .grp{display:flex;gap:8px;flex-wrap:wrap}
-.field{margin-bottom:12px}
-.field label{display:block;font-size:12px;color:var(--sub);margin-bottom:5px}
-.field input,.field select{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:8px 10px;font-size:13px}
-.search{background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:7px 12px;font-size:13px;min-width:220px;max-width:100%}
-.search::placeholder{color:var(--sub)}
+.rowbtns{display:flex;gap:5px;flex-wrap:wrap}
+.subhead{font-size:13px;color:var(--pri);margin:18px 0 8px;font-weight:600}
 .rate{color:var(--pri);font-weight:600;white-space:nowrap}
-.pwin{display:flex;gap:6px;align-items:center}
-.pwin input{flex:1}
-.fsec{margin-bottom:18px}
-.fsec h3{font-size:13px;color:var(--sub);margin:0 0 8px;border-bottom:1px solid var(--line);padding-bottom:6px}
-.login-box{background:var(--card2);border:1px dashed var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
-.qr{background:#fff;border-radius:10px;padding:12px;display:inline-block;text-align:center}
-.qr img{max-width:200px;border-radius:6px}
 .connrow{display:flex;align-items:flex-start;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:12px;line-height:1.6}
 .connrow code{flex:0 0 76px;color:var(--pri)}
 .connrow .cpy{word-break:break-all;cursor:pointer;color:var(--txt)}
 .connrow .cpy:hover{color:var(--pri)}
-.connrow .cpy.warn{color:var(--warn)}
-textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:8px 10px;font-size:13px;box-sizing:border-box}
+.fsec{margin-bottom:18px}
+.fsec h3{font-size:13px;color:var(--sub);margin:0 0 8px;border-bottom:1px solid var(--line);padding-bottom:6px}
+.qr{background:#fff;border-radius:10px;padding:12px;display:inline-block;text-align:center}
+.qr img{max-width:200px;border-radius:6px}
 .qr .ph{color:#999;font-size:13px}
-.empty{color:var(--sub);text-align:center;padding:24px;font-size:13px}
-.toast{position:fixed;top:16px;right:16px;z-index:999;display:flex;flex-direction:column;gap:8px}
-.toast .t{min-width:260px;max-width:360px;padding:12px 14px;border-radius:9px;font-size:13px;background:var(--card2);border:1px solid var(--line);box-shadow:0 8px 24px rgba(0,0,0,.4);line-height:1.5}
-.toast .t.ok{border-color:var(--ok)}.toast .t.err{border-color:var(--err)}
+
+/* ── 滚动条 ── */
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#2b3646;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#3a4759}
+
+/* ── 小屏 ── */
+@media(max-width:720px){
+  .wrap{padding:14px}
+  .brand h1{font-size:19px}
+  .box{padding:14px}
+  table{font-size:12px}
+  th,td{padding:9px 7px}
+  .rowbtns{flex-wrap:wrap}
+}
 </style></head><body><div class="wrap">
 <header class="top"><div class="brand">
 <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#0a84ff" stroke-width="2"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>
@@ -1386,6 +1612,9 @@ textarea{width:100%;background:var(--card2);border:1px solid var(--line);color:v
    <button class="btn btn-warn" onclick="runAll('checkin','')">全部签到</button>
    <button class="btn btn-pri" onclick="runAll('credits','')">全部刷新积分</button>
    <button class="btn btn-info" onclick="runAll('refresh','')">全部刷新Token</button>
+   <button class="btn btn-ok" onclick="runAll('enable','')" title="把所有被禁用/冷却/低积分的账号恢复参与轮转">全部启用</button>
+   <button class="btn btn-warn" onclick="runAll('unlock','')" title="批量解除低积分限制或冷却（永久禁用的账号不可解锁，需重新登录）">全部解锁</button>
+   <button class="btn btn-err" onclick="runAll('disable','')" title="暂停所有账号参与轮转（可再「全部启用」恢复）">全部禁用</button>
  </div><span class="hint" id="acctCount">账号：加载中…</span></div>
  <div class="box">
    <div class="subhead">WorkBuddy（CodeBuddy）</div>
@@ -1507,8 +1736,43 @@ function fmtRate(m){
 function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='settings')loadSettings();}
 function refreshAll(){loadOverview(true);loadAccounts();}
 function fmtT(v){if(!v)return '—';const t=new Date(v*1000);if(isNaN(t))return String(v);return t.toLocaleString('zh-CN',{hour12:false});}
-function stateBadge(a){if(a.disabled)return '<span class="badge b-bad">已禁用</span>';if(a.low_credit)return '<span class="badge b-warn">低积分</span><div class="hint">仅限 0 费率模型</div>';if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');return '<span class="badge b-ok">可用</span>';}
-function tokenCell(a){let h='<span class="badge" style="background:rgba(255,255,255,.06);color:var(--sub)">无刷新令牌</span>';if(a.has_refresh){const left=(a.expires_at||0)-(Date.now()/1000);h=left<=0?'<span class="badge b-bad">已过期</span>':(left<86400?'<span class="badge b-warn">即将过期</span>':'<span class="badge b-info">正常</span>');}return fmtT(a.expires_at)+'<div class="hint">'+h+'</div>';}
+// stateBadge 渲染账号状态徽章 + 原因说明。
+//
+// 后端早就输出 reason（如 "session dead" / "refresh session dead" / "手工禁用"），
+// 但前端此前【完全没用】，一律显示"已禁用" —— 用户看不出为什么被禁，
+// 也不知道 session 失效时「启用」是无效的（会陷入启用→又被禁的循环）。
+function stateBadge(a){
+  if(a.disabled){
+    const dead=isSessionDead(a.reason);
+    const label=dead?'已禁用·需重新登录':'已禁用';
+    return '<span class="badge b-bad">'+label+'</span>'
+      +(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'')
+      +(dead?'<div class="hint" style="color:var(--warn)">启用无效，请删除后重新登录</div>':'');
+  }
+  if(a.low_credit)return '<span class="badge b-warn">低积分</span><div class="hint">仅限 0 费率模型</div>';
+  if(a.cooling)return '<span class="badge b-warn">冷却中</span>'+(a.reason?'<div class="hint">'+esc(a.reason)+'</div>':'');
+  return '<span class="badge b-ok">可用</span>';
+}
+// tokenCell 渲染 token 过期状态。
+//
+// ⚠️ 阈值修复：原用 left<86400(24h) 判"即将过期"，
+// 但上游对不同账号给的 expiresIn 差异很大（实测：多数账号 30~55 天，
+// 个别账号仅约 10 小时）。短有效期账号一刷新完就落在 24h 内，
+// 会【恒定显示"即将过期"】，让人误以为账号有问题（实际它在正常服务）。
+//
+// 改法：只有真正临期（<1h）才告警；24h 内且短有效期显示为"短效"，
+// 避免把上游的策略差异误报成故障。
+function tokenCell(a){
+  let h='<span class="badge" style="background:rgba(255,255,255,.06);color:var(--sub)">无刷新令牌</span>';
+  if(a.has_refresh){
+    const left=(a.expires_at||0)-(Date.now()/1000);
+    if(left<=0) h='<span class="badge b-bad">已过期</span>';
+    else if(left<3600) h='<span class="badge b-warn">即将过期</span>';
+    else if(left<86400) h='<span class="badge b-mut" title="上游对该账号签发的 token 有效期较短（约十余小时），刷新后会自动续期">短效</span>';
+    else h='<span class="badge b-info">正常</span>';
+  }
+  return fmtT(a.expires_at)+'<div class="hint">'+h+'</div>';
+}
 async function loadOverview(force){const d=await api('overview');if(d.error){toast(d.error,'err');return;}const dot=document.getElementById('srvDot'),txt=document.getElementById('srvTxt');dot.className='dot '+(d.server_up?'up':'down');txt.textContent=d.server_up?'运行中':'已停止';
 const u=document.getElementById('loginUser');if(u){u.textContent='已登录: '+esc(d.webui_user||'admin');u.style.display='inline-block';}
 const cards=[
@@ -1534,21 +1798,78 @@ if(kb){kb.innerHTML=(isIngress?('<div class="hint" style="margin:0 0 8px;color:v
 +'<div class="hint" style="margin-top:6px">客户端（OpenAI 兼容）填 Base URL 时加 <code>/v1</code>，模型名必须带来源前缀：<code>workbuddy/</code>、<code>traework/</code> 或 <code>qoder/</code>。</div>';}
 scheduleOv(!force);}
 function scheduleOv(c){if(ovTimer)clearTimeout(ovTimer);if(c)ovTimer=setTimeout(()=>loadOverview(false),6000);}
+// 面板自动刷新：此前只有一次 6s 延时（且仅首次触发），之后必须手动点，
+// 导致积分/费率长期停留在旧值。改为按当前 tab 周期轮询。
+//
+// 频率：概览/账号 30s（积分变化慢，太频繁会反复打上游）；模型页 60s。
+// 页面不可见时停止轮询（省资源，也避免后台持续请求上游）。
+var pollTimer=null,pollMs=30000;
+function currentTab(){var t=document.querySelector('.tab.active');return t?t.dataset.p:'';}
+function refreshNow(){
+  if(document.hidden)return;
+  var p=currentTab();
+  if(p==='overview')loadOverview(false);
+  else if(p==='accounts')loadAccounts();
+  else if(p==='models'){if(typeof loadModels==='function')loadModels();if(typeof loadFees==='function')loadFees();}
+}
+function startPoll(){
+  if(pollTimer)clearInterval(pollTimer);
+  pollMs=(currentTab()==='models')?60000:30000;
+  pollTimer=setInterval(refreshNow,pollMs);
+}
+// 切 tab 时重置节奏（模型页更低频）
+var _switchPanel=typeof switchPanel==='function'?switchPanel:null;
+if(_switchPanel){switchPanel=function(n){_switchPanel(n);startPoll();refreshNow();};}
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden){if(pollTimer)clearInterval(pollTimer);pollTimer=null;}
+  else{startPoll();refreshNow();}
+});
+startPoll();
+// isSessionDead 判断禁用原因是否为「登录态失效」（token 彻底不可用）。
+//
+// 这类账号的 token 已彻底失效：面板「启用」只是清掉 disabled 标记，
+// 下次请求仍会 401 再次被禁用 —— 用户会陷入「启用→又被禁」的死循环。
+// 正确做法是删除后重新登录，UI 必须据此引导而不是给一个无效的「启用」按钮。
+//
+// ⚠️ 判据必须【严格】：此前用 /session|12153|token|refresh/ 过宽，
+// 会把 "429 rate limit"、"refresh: xxx"（限流/刷新失败，可恢复）
+// 也误判成"需重新登录"，导致用户以为账号没救了而误删（真实事故）。
+//
+// 只有以下明确形态才算 session 死亡：
+//   - "session dead" / "refresh session dead"（后端 Disable 的 reason）
+//   - 12153（上游 offline session 业务码）
+//   - TOKEN_EXPIRE（Qoder 的明确过期标记）
+function isSessionDead(r){
+  const s=String(r||'');
+  return /session\s*dead/i.test(s) || /\b12153\b/.test(s) || /TOKEN_EXPIRE/i.test(s);
+}
+function disabledTip(r){
+  return isSessionDead(r)
+    ? '登录态已失效，「启用」无效，请删除后重新登录'
+    : (String(r||'').match(/429|rate limit|限流/i)
+        ? '上游限流/冷却中，可点「启用」或稍后自动恢复'
+        : '手工禁用，可点「启用」恢复');
+}
 async function loadAccounts(){const d=await api('accounts');const wbB=document.getElementById('wbBody'),trB=document.getElementById('trBody'),qdB=document.getElementById('qdBody'),empty=document.getElementById('acctEmpty'),cnt=document.getElementById('acctCount');if(d.error){toast(d.error,'err');return;}
 const accs=d.accounts||[];const wb=accs.filter(a=>a.kind==='workbuddy'),tr=accs.filter(a=>a.kind==='traework'),qd=accs.filter(a=>a.kind==='qoder');
 const isQ=a=>a.kind==='qoder';
-const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hint">'+esc(a.uid)+'<button class="btn sm btn-ok" title="复制 UID" onclick="copyAcctValue(this,'+JSON.stringify(String(a.uid))+')">复制</button></td><td><b>'+(a.credits||0).toLocaleString()+'</b></td><td>'+stateBadge(a)+'</td><td>'+tokenCell(a)+'</td><td><div class="rowbtns">'+
+const row=a=>'<tr><td><b>'+esc(a.nickname||'未命名')+'</b></td><td class="hint">'+esc(a.uid)+'<button class="btn sm btn-ok" title="复制 UID" onclick="copyAcctValue(this,&#39;'+esc(a.uid)+'&#39;)">复制</button></td><td><b>'+(a.credits||0).toLocaleString()+'</b></td><td>'+stateBadge(a)+'</td><td>'+tokenCell(a)+'</td><td><div class="rowbtns">'+
 (isQ(a)?'':('<button class="btn sm btn-ok" onclick="acctAction(&#39;checkin&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">签到</button>'))+
 '<button class="btn sm btn-pri" onclick="acctAction(&#39;credits&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新积分</button>'+
 '<button class="btn sm btn-info" onclick="acctAction(&#39;refresh&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">刷新Token</button>'+
 ((!a.disabled&&(a.low_credit||a.cooling))?('<button class="btn sm btn-warn" title="解除低积分限制或冷却，立即恢复参与轮转" onclick="acctAction(&#39;unlock&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">'+(a.low_credit?'解锁':'解禁')+'</button>'):'')+
-(a.disabled?('<button class="btn sm btn-ok" title="重新启用该账号，参与轮转" onclick="acctAction(&#39;enable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">启用</button>'):('<button class="btn sm btn-warn" title="手工禁用该账号，暂停参与轮转（可再启用）" onclick="acctAction(&#39;disable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">禁用</button>'))+
+(a.disabled?(isSessionDead(a.reason)
+   ?('<span class="badge b-bad" title="'+esc(disabledTip(a.reason))+'">需重新登录</span><button class="btn sm btn-err" title="删除后重新扫码登录（登录态已失效，启用无效）" onclick="delAcct(&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">重新登录</button>')
+   :('<button class="btn sm btn-ok" title="'+esc(disabledTip(a.reason))+'" onclick="acctAction(&#39;enable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">启用</button>')
+ ):('<button class="btn sm btn-warn" title="手工禁用该账号，暂停参与轮转（可再启用）" onclick="acctAction(&#39;disable&#39;,&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">禁用</button>'))+
 '<button class="btn sm btn-danger" onclick="delAcct(&#39;'+a.kind+'&#39;,&#39;'+esc(a.uid)+'&#39;)">删除</button></div></td></tr>';
 wbB.innerHTML=wb.map(row).join('');trB.innerHTML=tr.map(row).join('');qdB.innerHTML=qd.map(row).join('');
 empty.style.display=(wb.length+tr.length+qd.length)?'none':'block';
 cnt.textContent='账号：WorkBuddy '+wb.length+' / TraeWork '+tr.length+' / Qoder '+qd.length+' 个';}
 async function acctAction(action,kind,uid){if(action==='disable'&&!confirm('确认禁用该账号？禁用后暂停参与轮转，可随时点「启用」恢复。'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{platform:kind,uid:uid}});showBatch(d);setTimeout(loadAccounts,1200);}
-async function runAll(action,uid){if(!confirm('确定要对所有账号执行吗？'))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{uid:''}});showBatch(d);setTimeout(loadAccounts,1300);}
+async function runAll(action,uid){
+ var tip={checkin:'确定要对所有账号执行【签到】吗？',credits:'确定要刷新所有账号的【积分】吗？',refresh:'确定要刷新所有账号的【Token】吗？',enable:'确定要【启用】所有账号吗？',unlock:'确定要【解锁】所有账号吗？（永久禁用账号不可解锁，需重新登录）',disable:'确定要【禁用】所有账号吗？禁用后全部暂停参与轮转，可点「全部启用」恢复'}[action]||('确定要对所有账号执行 '+action+' 吗？');
+ if(!confirm(tip))return;toast('正在执行…','info');const d=await api(action,{method:'POST',body:{uid:''}});showBatch(d);setTimeout(loadAccounts,1300);}
 function showBatch(d){if(d.error){toast(d.error,'err');return;}const rs=d.results||[];if(!rs.length){toast(d.message||'完成','ok');return;}rs.forEach(r=>toast((r.ok?'✓ ':'✗ ')+'['+(r.kind||'')+'] '+r.uid+'：'+r.msg,r.ok?'ok':'err'));}
 function copyAcctValue(el,val){if(!el||val===undefined||val===null)return;navigator.clipboard&&navigator.clipboard.writeText(String(val)).then(()=>toast('已复制','ok')).catch(()=>toast('复制失败','err'));}
 async function delAcct(kind,uid){const accs=(await api('accounts')).accounts||[];const a=accs.find(x=>x.kind===kind&&x.uid===uid);const nm=(a&&a.nickname)||uid;if(!confirm('确认删除账号「'+(nm||uid)+'」？\n删除后该账号将不再参与轮转，且需要重新登录才能恢复。'))return;const d=await api('delete',{method:'POST',body:{platform:kind,uid:uid}});toast(d.success?d.message:d.error,d.success?'ok':'err');setTimeout(loadAccounts,1500);}
