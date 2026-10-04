@@ -79,6 +79,11 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/backup
+          # 显式设置提交身份：
+          # 此前只在 clone 步骤设过，commit 步骤未继承到，
+          # 导致 fatal: empty ident name (...) not allowed（exit 128）。
+          git config user.name  "c3h3-ci"
+          git config user.email "deploy@homediy.top"
           # 删除除 .git 外所有内容，再拷入主线文件（保留备用仓库的历史，保证有共同祖先）
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
           cp -a "${GITHUB_WORKSPACE}/." .
