@@ -27,7 +27,7 @@
 
 1. 把本仓库作为自定义 add-on 仓库添加，或直接把本目录放到 `/addons/` 下
 2. 在 HA → 加载项 中找到 **AI Proxy** → 安装
-   - 镜像由 CI 预构建推送至 `ghcr.io/c3h3-ci/ai-proxy`，**安装时直接拉取，无需本地编译**
+   - 镜像由 CI 预构建推送至 `ghcr.io/c3h3-ai/ai-proxy`，**安装时直接拉取，无需本地编译**
 3. 配置（`config.yaml` 同款字段）：
    - `api_key`：OpenAI API 鉴权（空=不鉴权）
    - `region`：`cn` / `global`
@@ -109,7 +109,7 @@ make vet                                            # 静态检查
 ### 镜像（自动）
 
 多架构（amd64 / aarch64）镜像由 GitHub Actions 用 HA 官方 builder actions
-预构建并推送到 `ghcr.io/c3h3-ci/ai-proxy`，见 `.github/workflows/build-image.yml`。
+预构建并推送到 `ghcr.io/c3h3-ai/ai-proxy`，见 `.github/workflows/build-image.yml`。
 Supervisor 直接拉镜像，不在用户设备上编译。
 
 ### CI 门禁
@@ -159,7 +159,8 @@ python3 scripts/test_session_token.py   # 会话 token 生成与比较
 
 当前 `1.1.0b14`。详见 `CHANGELOG.md`。
 
-> ⚠️ 另一个仓库 `c3h3-ci/ai-proxy-test` 提供的是 `2.0.1` 构建，**落后于本仓库**——
+> 备用仓库 `c3h3-ci/ai-proxy` 与本仓库保持同步（自动镜像），
+> 主线开发在本仓库；如本仓库不可用可从备用仓库获取。
 > 它停在 2026-08-27，不含 TraeWork 通道修复（4008）、WorkBuddy 客户端识别头、
 > 面板登录鉴权等 8/30 之后的改动，且 addon 位于 `ai-proxy/` 子目录、
 > 构建上下文与本仓库不同（`COPY . /src` vs `COPY src /src`）。
