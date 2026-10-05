@@ -86,8 +86,15 @@ jobs:
           git config user.email "deploy@homediy.top"
           # 删除除 .git 外所有内容，再拷入主线文件（保留备用仓库的历史，保证有共同祖先）
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-          cp -a "${GITHUB_WORKSPACE}/." .
-          rm -rf .git.keep 2>/dev/null || true
+          # ⚠️ 必须排除 .git：
+          # 此前用 cp -a "${GITHUB_WORKSPACE}/." . 会把【主线仓库的 .git】
+          # 一起复制过来，覆盖备用仓库的 .git
+          # ——既丢失了刚设置的 git 身份（fatal: empty ident name），
+          #   也破坏了"保留备用仓库历史以保证有共同祖先"的前提。
+          tar -C "${GITHUB_WORKSPACE}" --exclude=.git -cf - . | tar -xf -
+          # 复制完成后再设一次身份（防止任何覆盖）
+          git config user.name  "c3h3-ci"
+          git config user.email "deploy@homediy.top"
           git add -A
           if git diff --cached --quiet; then
             echo "无差异，无需同步"
