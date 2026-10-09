@@ -152,6 +152,27 @@ type ResourceItem struct {
 	Total  int64  `json:"total"`
 	Used   int64  `json:"used"`
 	Remain int64  `json:"remain"`
+
+	// ── 以下字段供 ledger 差分对账与「过期/消耗」归因 ──
+	//
+	// 背景：此前本地只有上面 4 个字段，双流水账本（internal/ledger）因此
+	// **无法区分「积分包到期作废」与「正常消耗」** —— 而能区分这两者正是
+	// ledger 与 stats 刻意不合并的根本理由（上游 R43）。ledger 包内一度用
+	// provider_compat.go 复刻这些字段绕过；这里补齐到源头。
+	//
+	// 新增字段零值安全，旧调用方不填也能正常编译运行。
+
+	// ExpireAt 该条目到期时刻，YYYY-MM-DD（UTC+8 墙钟）。
+	// 空串表示上游未下发到期时间 —— 不得用零值时间冒充「永不过期」。
+	ExpireAt string `json:"expire_at,omitempty"`
+	// Key 条目稳定标识（上游 ID，如 TraeWork entitlement_id），
+	// 供 ledger 差分对账用；渠道无 ID 时留空，差分退回 Name 作伪键。
+	Key string `json:"key,omitempty"`
+	// Usable 是否属于本工具可消耗的额度池。
+	// 零值为 false，故各渠道构造时须显式置位；渠道无此概念时统一填 true。
+	Usable bool `json:"usable"`
+	// InfoOnly 只作展示，不参与任何积分算术。
+	InfoOnly bool `json:"info_only,omitempty"`
 }
 
 // Rotatable 报告该错误是否应【换下一个账号重试本请求】（账号级错误）。

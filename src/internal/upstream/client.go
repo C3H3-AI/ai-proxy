@@ -517,15 +517,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 	var resp struct {
 		Response struct {
 			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
+				Accounts []resourceAccount `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
 	}
@@ -575,15 +567,7 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 	var resp struct {
 		Response struct {
 			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
+				Accounts []resourceAccount `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
 	}
@@ -606,11 +590,17 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 			remain = 0
 		}
 		total += remain
+		exp := acct.expireAt()
 		items = append(items, provider.ResourceItem{
 			Name:   acct.PackageName,
 			Total:  total_,
 			Used:   used,
 			Remain: remain,
+			// 到期日：缺了无法区分「周期结束作废」与「正常消耗」。
+			ExpireAt: exp,
+			// 伪键：上游无显式 ID，用 套餐名|到期日 区分同名录包的不同周期
+			Key:    acct.PackageName + "|" + exp,
+			Usable: true, // 国内版无端点分区，所有套餐均可被本工具消耗
 		})
 	}
 	return total, items, nil
@@ -734,4 +724,37 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// resourceAccount get-user-resource 中的单个套餐条目。
+type resourceAccount struct {
+	PackageName         string `json:"PackageName"`
+	CapacitySize        int64  `json:"CapacitySize"`
+	CapacityRemain      int64  `json:"CapacityRemain"`
+	CapacityUsed        int64  `json:"CapacityUsed"`
+	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+	// CycleEndTime 本周期结束墙钟串（"2006-01-02 15:04:05"）。
+	// 有了它 ledger 才能把余额下降归因到「周期结束作废」而非「正常消耗」；
+	// 缺失时 expireAt() 返回空串，账本退回「条目消失」推断（旧行为）。
+	CycleEndTime string `json:"CycleEndTime"`
+}
+
+// resourceExpireLoc 到期日解析所用时区（UTC+8），与 ledger 及上游口径一致。
+var resourceExpireLoc = time.FixedZone("UTC+8", 8*60*60)
+
+// expireAt 把 CycleEndTime 墙钟串转为 YYYY-MM-DD；缺失/不可解析时返回空串。
+//
+// 空串语义重要：上游对无到期概念的套餐不下发该字段，
+// 不得用零值时间冒充「永不过期」（会让账本把真实过期误判为消耗）。
+func (r resourceAccount) expireAt() string {
+	ts := strings.TrimSpace(r.CycleEndTime)
+	if ts == "" {
+		return ""
+	}
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, resourceExpireLoc); err == nil {
+		return t.Format("2006-01-02")
+	}
+	return ""
 }

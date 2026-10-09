@@ -556,11 +556,17 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 				}
 				PackageName string `json:"package_name"`
 				PackageType string `json:"package_type"`
+				// EntitlementID 上游条目稳定标识，供 ledger 差分对账；
+				// 月周期切换时旧键消失、同余额挂新键，没有它就无法区分
+				// 「条目到期」与「条目改名」。
+				EntitlementID string `json:"entitlement_id"`
 			} `json:"entitlement_base_info"`
 			DisplayDesc string `json:"display_desc"`
 			GroupName   string `json:"group_name"`
 			GroupType   int    `json:"group_type"`
-			Usage       struct {
+			// ExpireTime 到期 Unix 秒；上游对无到期条目下发 0。
+			ExpireTime int64 `json:"expire_time"`
+			Usage      struct {
 				CreditsAmount float64 `json:"credits_amount"`
 			} `json:"usage"`
 		} `json:"user_entitlement_pack_list"`
@@ -597,6 +603,12 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 			Total:  limit,
 			Used:   used,
 			Remain: remain,
+			// 到期日与稳定标识：缺了它们 ledger 只能靠「条目消失」推断过期，
+			// 无法区分「到期作废」与「正常消耗」。
+			ExpireAt: unixDate(p.ExpireTime),
+			Key:      p.EntitlementBaseInfo.EntitlementID,
+			// 本地无可消耗池/不可用池区分，按上游约定「无此概念填 true」。
+			Usable: true,
 		})
 	}
 	return total, items, nil
@@ -646,4 +658,17 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// entExpireLoc 权益到期日所用时区（UTC+8），
+// 与 ledger 及 workbuddy 侧的到期口径保持一致。
+var entExpireLoc = time.FixedZone("UTC+8", 8*60*60)
+
+// unixDate 把上游 Unix 秒转为 UTC+8 的 YYYY-MM-DD。
+// 0 或负值（上游未下发到期时间）返回空串 —— 不得用零值冒充「永不过期」。
+func unixDate(sec int64) string {
+	if sec <= 0 {
+		return ""
+	}
+	return time.Unix(sec, 0).In(entExpireLoc).Format("2006-01-02")
 }
