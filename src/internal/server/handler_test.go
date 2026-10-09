@@ -142,7 +142,15 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	}
 }
 
-func TestChatAllUnavailableReturns503(t *testing.T) {
+// TestChatAllUnavailableTransparentUpstreamError —— 候选耗尽时【透传真实上游错误】。
+//
+// 移植自上游 wild-work PR #82：本次请求确实逐号尝试过，包装成 503 会丢掉
+// 上游细节（如 429 + 6004 重置时间、402 余额不足），客户端不知道真实原因、
+// 也不知道何时可重试。故原样回写最后一个上游响应。
+//
+// 注意：这改变了既有契约（旧版一律 503 + error envelope）。
+// 新行为更有用：余额不足时客户端重试无意义，直接告知原因更合理。
+func TestChatAllUnavailableTransparentUpstreamError(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 402, `{"code":1,"msg":"余额不足"}`, false
 	})
@@ -153,8 +161,30 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"workbuddy/glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
+	// 透传：保留上游 402 与原始 body
+	if rec.Code != 402 {
 		t.Errorf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "余额不足") {
+		t.Errorf("应保留上游原始 body，实际=%s", rec.Body)
+	}
+}
+
+// TestChatNoUpstreamErrorStill503 —— 压根没发出过上游请求
+// （账号全被禁用/冷却）时，仍返回 503 + error envelope 的可操作引导。
+func TestChatNoUpstreamErrorStill503(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 先禁用，使 pickWithSticky 选不到账号 → 不会发出任何上游请求
+	p.Disable("u1", "session dead")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `ok`, false
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"workbuddy/glm-5.2","messages":[]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 503 {
+		t.Errorf("无上游错误时应返回 503，实际=%d body=%s", rec.Code, rec.Body)
 	}
 	var e map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &e)
@@ -172,9 +202,11 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"workbuddy/glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
+	// 透传上游 401（候选耗尽时保留上游语义），而非包装成 503
+	if rec.Code != 401 {
 		t.Errorf("code=%d", rec.Code)
 	}
+	// 本测试的核心：session dead 必须禁用账号
 	st, _ := p.Status("u1")
 	if !st.Disabled {
 		t.Errorf("account should be disabled: %+v", st)
@@ -565,7 +597,7 @@ func TestHardCreditCooldownDependsOnFreeModel(t *testing.T) {
 	rt := h.cfg.Runtimes[provider.WorkBuddy]
 
 	// 免费模型：短冷却，账号稍后仍可参与轮转
-	h.applyUpstreamError(rt, "u1", provider.ErrHardCredit, true)
+	h.applyUpstreamError(rt, "u1", provider.ErrHardCredit, true, nil, "")
 	st, _ := p.Status("u1")
 	if !st.Cooling {
 		t.Fatalf("期望冷却: %+v", st)
@@ -579,7 +611,7 @@ func TestHardCreditCooldownDependsOnFreeModel(t *testing.T) {
 
 	// 付费模型：仍按硬冷却（低积分账号报余额不足非免费额度问题）
 	p.ReenableIfCredits("u1", 0) // 复位冷却，并重新标记 lowCredit
-	h.applyUpstreamError(rt, "u1", provider.ErrHardCredit, false)
+	h.applyUpstreamError(rt, "u1", provider.ErrHardCredit, false, nil, "")
 	st, _ = p.Status("u1")
 	if st.Reason != "免费额度已用完，次日恢复" {
 		t.Errorf("付费路径 reason=%q", st.Reason)

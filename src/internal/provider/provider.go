@@ -153,3 +153,33 @@ type ResourceItem struct {
 	Used   int64  `json:"used"`
 	Remain int64  `json:"remain"`
 }
+
+// Rotatable 报告该错误是否应【换下一个账号重试本请求】（账号级错误）。
+//
+// 移植自上游 wild-work PR #82（d4314a2），但按本项目更细的 ErrKind 语义调整：
+//
+//	账号有问题的（限流/欠费/登录态死/404/5xx/WAF/账号故障/模型不存在/业务错误）
+//	  → 换号有价值，重试本请求；
+//	请求内容有问题的（内容拦截 / 上下文超限 / 请求体解析失败）
+//	  → 换任何账号都必然复现，应【立刻透传原文】结束，
+//	    否则会白白轮转、消耗其他账号配额，且客户端会收到本可避免的 503。
+//
+// 与 PenalizesAccount 的关系：两者互补，判定对象不同
+//   - PenalizesAccount：决定是否【罚账号】（冷却/禁用/计数）
+//   - Rotatable：决定是否【换号重试】
+//
+// 注意 ErrBadParams：其定义注释为"不罚号，但仍轮转"，
+// 故这里返回 true（与 PromptTooLong"不轮转"形成对照）。
+func (k ErrKind) Rotatable() bool {
+	switch k {
+	case ErrContentBlocked, ErrPromptTooLong:
+		// 请求本身的问题：换号必然复现 → 不换号，透传原文
+		return false
+	case ErrSoftRate, ErrHardCredit, ErrSessionDead, ErrNotFound,
+		ErrServer, ErrClient, ErrWafBlock, ErrAccountFault,
+		ErrModelBlocked, ErrBadParams, ErrPassthrough:
+		return true
+	default:
+		return true
+	}
+}
