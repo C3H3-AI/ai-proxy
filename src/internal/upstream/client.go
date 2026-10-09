@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"github.com/rockswang/workbuddy-wild/internal/idle"
 	"io"
 	"log"
 	"net"
@@ -218,12 +219,12 @@ func New() *Client {
 	// 网络抖动时会出现长时间无响应（且流式 client 没有总时长上限）。
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 15 * time.Second}
 	tr := &http.Transport{
-		DialContext:           dialer.DialContext,
-		TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper), // 禁 h2
-		TLSHandshakeTimeout:   10 * time.Second,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       90 * time.Second,
+		DialContext:         dialer.DialContext,
+		TLSNextProto:        make(map[string]func(string, *tls.Conn) http.RoundTripper), // 禁 h2
+		TLSHandshakeTimeout: 10 * time.Second,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
 		// 首字节（响应头）超时：流式请求靠它防止建连后永久挂起，
 		// 与 traework 的 StreamHTTP 保持一致的 120s 口径。
 		ResponseHeaderTimeout: 120 * time.Second,
@@ -375,20 +376,27 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	ChatHeaders(req, a)
+	// 流中空闲监控：streamClient 刻意不设总时长（支持长回答），
+	// 但上游中途卡死会让请求无限期挂起，连接与 goroutine 无法释放。
+	// 挂可取消 ctx + 对 body 加空闲监控：静默超阈值即主动断流。
+	req, cancel := idle.WithCancel(req)
 	resp, err := c.streamClient().Do(req)
 	if err != nil {
+		cancel()
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 成功路径：body 的 Close 会停掉监控并 cancel
+	return idle.Monitor(cancel, resp.Body, idle.DefaultTimeout), resp.StatusCode, nil, nil
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
@@ -594,7 +602,9 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 		default:
 			total_, used, remain = acct.CapacitySize, acct.CapacityUsed, acct.CapacityRemain
 		}
-		if remain < 0 { remain = 0 }
+		if remain < 0 {
+			remain = 0
+		}
 		total += remain
 		items = append(items, provider.ResourceItem{
 			Name:   acct.PackageName,
@@ -661,9 +671,9 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 		Code int `json:"code"`
 		Data struct {
 			Models []struct {
-				ID      string `json:"id"`
-				Name    string `json:"name"`
-				Credits string `json:"credits"` // "x0.79 credits"
+				ID      string   `json:"id"`
+				Name    string   `json:"name"`
+				Credits string   `json:"credits"` // "x0.79 credits"
 				Tags    []string `json:"tags"`
 			} `json:"models"`
 		} `json:"data"`
