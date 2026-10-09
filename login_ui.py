@@ -897,6 +897,40 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
     def _handle_overview(self):
         self._send_json(overview_data())
 
+    # ---- 运行统计 / 双流水账本 ----
+    #
+    # 数据源在 serverd 常驻进程（内存 stats 引擎 + 磁盘 ledger），面板只是转发：
+    # 面板进程里没有这两份数据，走代理才能拿到真实值。
+    #
+    # ⚠️ 必须带 api_key（srvd_request 已注入）：serverd 的 /api/stats 与
+    # /api/ledger 与 /api/accounts/* 同走 withAuth，配置过 api_key 时
+    # 不带 Bearer 一律 401（返回体是 OpenAI 错误结构，前端会当成无数据）。
+    #
+    # 降级：serverd 未就绪/统计引擎未初始化（503）时不返回 500 掩盖原因——
+    # 原样把 error 文案透给前端，面板在区块里显示「统计暂不可用（不影响代理转发）」，
+    # 与后端 stats_unavailable / ledger_unavailable 的措辞保持一致。
+    def _handle_stats(self):
+        data, err = srvd_request("/api/stats", timeout=20)
+        if err:
+            self._send_json({"error": err}, 502)
+            return
+        self._send_json(data or {})
+
+    def _handle_ledger(self):
+        # days ∈ {1,7}；其他值交给后端按 7 处理（ledger.Query 口径）。
+        days = "7"
+        try:
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if (q.get("days") or [""])[0] == "1":
+                days = "1"
+        except Exception:
+            pass
+        data, err = srvd_request("/api/ledger?days=" + days, timeout=30)
+        if err:
+            self._send_json({"error": err}, 502)
+            return
+        self._send_json(data or {})
+
     def _handle_accounts(self):
         accounts, err = list_accounts()
         if err:
@@ -1224,6 +1258,10 @@ class LoginHandler(http.server.BaseHTTPRequestHandler):
             self._handle_accounts()
         elif match_key(path, "models"):
             self._handle_models()
+        elif match_key(path, "stats"):
+            self._handle_stats()
+        elif match_key(path, "ledger"):
+            self._handle_ledger()
         elif match_key(path, "fees"):
             self._handle_fees()
         elif match_key(path, "config"):
@@ -1553,6 +1591,49 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
 ::-webkit-scrollbar-thumb{background:#2b3646;border-radius:6px;border:2px solid var(--bg)}
 ::-webkit-scrollbar-thumb:hover{background:#3a4759}
 
+/* ── 运行统计：纯 CSS 条形图 ────────────────────────────────
+   面板走 HA ingress，不能引任何外部图表库（echarts/CDN 均不可用），
+   条形图用「轨道 + 填充宽度百分比」实现：轨道 .bar，填充 .bar>i。
+   颜色继续沿用琥珀/青/绿 token，与卡片体系一致。 ─────────────── */
+.bar{
+  position:relative; height:8px; border-radius:5px; overflow:hidden;
+  background:rgba(255,255,255,.055); box-shadow:inset 0 0 0 1px rgba(255,255,255,.03);
+}
+.bar>i{
+  display:block; height:100%; border-radius:5px; min-width:2px;
+  background:linear-gradient(90deg,var(--pri),var(--pri2));
+  animation:barIn .55s cubic-bezier(.2,.8,.2,1) backwards;
+}
+.bar.ok>i{background:linear-gradient(90deg,#2fb96f,var(--ok))}
+.bar.cy>i{background:linear-gradient(90deg,#3aa9d8,var(--info))}
+.bar.bad>i{background:linear-gradient(90deg,#d94a4a,var(--err))}
+/* 只写 from：to 帧用元素自身的行内 width（各条比例不同，不能写死）
+   backwards 让动画开始前先按 0 渲染，避免首帧闪一下满条 */
+@keyframes barIn{from{width:0}}
+/* 条形榜行：标签 + 轨道 + 数值（数值等宽右对齐） */
+.barrow{display:grid;grid-template-columns:minmax(84px,1.5fr) 3fr auto;gap:10px;align-items:center;padding:6px 0}
+.barrow .nm{font-size:12.5px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.barrow .vv{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px;color:var(--sub);text-align:right;min-width:76px}
+.barrow.mut .nm{color:var(--sub)}
+/* 三色对比条：收入 / 消耗 / 过期（同尺度，便于目视比较） */
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--sub);margin-top:10px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{width:9px;height:9px;border-radius:3px;display:inline-block}
+/* 账本流水：类型色点 */
+.kd{display:inline-flex;align-items:center;gap:5px;font-weight:600}
+.kd::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--dim)}
+.kd.earn::before{background:var(--ok)} .kd.spend::before{background:var(--pri)} .kd.expire::before{background:var(--err)}
+.kd.earn{color:var(--ok)} .kd.spend{color:var(--pri)} .kd.expire{color:var(--err)}
+/* 窗口切换（1日/7日）：与 .tab 同族的胶囊分段控件 */
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:var(--bg2)}
+.seg button{
+  border:0;background:transparent;color:var(--dim);font-size:12px;font-weight:600;
+  padding:5px 14px;cursor:pointer;transition:color .15s ease,background .15s ease;
+}
+.seg button:hover{color:var(--txt)}
+.seg button.on{color:#241703;background:linear-gradient(180deg,var(--pri),#d98a2b)}
+.stathint{font-size:11.5px;color:var(--dim);margin-top:8px;line-height:1.5}
+
 /* ── 小屏 ── */
 @media(max-width:720px){
   .wrap{padding:14px}
@@ -1561,6 +1642,8 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
   table{font-size:12px}
   th,td{padding:9px 7px}
   .rowbtns{flex-wrap:wrap}
+  .barrow{grid-template-columns:minmax(72px,1.2fr) 2fr auto;gap:7px}
+  .barrow .vv{min-width:64px}
 }
 </style></head><body><div class="wrap">
 <header class="top"><div class="brand">
@@ -1574,7 +1657,9 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
 <button class="tab active" data-p="overview" onclick="switchPanel('overview')">概览</button>
 <button class="tab" data-p="accounts" onclick="switchPanel('accounts')">账号</button>
 <button class="tab" data-p="models" onclick="switchPanel('models')">模型</button>
+<button class="tab" data-p="stats" onclick="switchPanel('stats')">运行统计</button>
 <button class="tab" data-p="settings" onclick="switchPanel('settings')">设置</button>
+<button class="tab" data-p="stats" onclick="switchPanel('stats')">运行统计</button>
 </nav>
 <div class="toast" id="toastBox"></div>
 
@@ -1653,6 +1738,61 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
  </div>
 </section>
 
+<section class="panel" id="panel-stats">
+ <div class="tbar"><div class="grp">
+  <button class="btn btn-pri" onclick="loadStats()">刷新统计</button>
+  <span class="seg" id="ledgerSeg">
+    <button class="on" data-d="1" onclick="setLedgerDays(1)">1 日</button>
+    <button data-d="7" onclick="setLedgerDays(7)">7 日</button>
+  </span>
+ </div><span class="hint" id="statsInfo">加载中…</span></div>
+
+ <div class="cards" id="stCards"></div>
+
+ <div class="box">
+  <h2>Token 用量</h2>
+  <div id="stTokens"></div>
+  <div class="stathint" id="stTokensHint"></div>
+ </div>
+
+ <div class="box">
+  <h2>积分流水（账本 earn / spend / expire）</h2>
+  <div id="stCredit"></div>
+  <div class="legend">
+    <span><i style="background:linear-gradient(90deg,#2fb96f,var(--ok))"></i>收入 earn</span>
+    <span><i style="background:linear-gradient(90deg,var(--pri),var(--pri2))"></i>消耗 spend</span>
+    <span><i style="background:linear-gradient(90deg,#d94a4a,var(--err))"></i>过期 expire</span>
+  </div>
+  <div class="stathint" id="stCreditHint"></div>
+ </div>
+
+ <div class="box">
+  <h2>渠道余额分布</h2>
+  <div id="stPlatforms"></div>
+ </div>
+
+ <div class="box">
+  <h2>模型消耗排行</h2>
+  <div id="stModels"></div>
+ </div>
+
+ <div class="box">
+  <h2>临期额度（7 日内）</h2>
+  <div id="stExpiry"></div>
+  <div class="stathint" id="stExpiryHint"></div>
+ </div>
+
+ <div class="box">
+  <h2>账本流水</h2>
+  <div class="tbar" style="margin-bottom:10px"><span class="hint" id="stLedgerCount"></span></div>
+  <div style="max-height:420px;overflow:auto">
+   <table><thead><tr><th>时间</th><th>账号</th><th>渠道</th><th>类型</th><th>金额</th><th>余额</th><th>备注</th></tr></thead>
+   <tbody id="stLedgerBody"></tbody></table>
+  </div>
+  <div class="empty" id="stLedgerEmpty" style="display:none">窗口内暂无流水。</div>
+ </div>
+</section>
+
 <section class="panel" id="panel-settings">
  <div class="box"><h2>设置</h2>
   <p class="hint" style="margin:0 0 14px">保存后写入 <code>/data/options.json</code> 并热重启 serverd 生效（不影响本面板）。</p>
@@ -1683,6 +1823,37 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
   </div>
   <div class="tbar"><button class="btn btn-ok" onclick="saveSettings()">保存设置</button>
   <button class="btn btn-pri" onclick="loadSettings()">重新加载</button></div>
+ </div>
+</section>
+<section class="panel" id="panel-stats">
+ <div class="box">
+   <div class="tbar"><div class="grp">
+     <button class="btn btn-info" onclick="loadStats()">立即刷新</button>
+     <button class="btn" id="statsDay1" onclick="setStatsDays(1)">今日</button>
+     <button class="btn btn-pri" id="statsDay7" onclick="setStatsDays(7)">近 7 日</button>
+   </div><span class="hint" id="statsHint">加载中…</span></div>
+
+   <div class="subhead">用量总览</div>
+   <div class="cards" id="stCards"></div>
+
+   <div class="subhead">Token 用量</div>
+   <div class="cards" id="stTokens"></div>
+
+   <div class="subhead">积分流水（收入 / 消耗 / 过期）</div>
+   <div class="cards" id="stCredit"></div>
+
+   <div class="subhead">各渠道余额</div>
+   <table><thead><tr><th>渠道</th><th>账号</th><th>积分</th><th>Token</th><th>状态</th></tr></thead>
+   <tbody id="stPlatforms"></tbody></table>
+
+   <div class="subhead">模型消耗排行</div>
+   <table><thead><tr><th>模型</th><th>积分</th><th>占比</th></tr></thead>
+   <tbody id="stModels"></tbody></table>
+
+   <div class="subhead">账本流水（最近条目，时间升序）</div>
+   <table><thead><tr><th>时间</th><th>渠道</th><th>账号</th><th>类型</th><th>金额</th><th>余额</th><th>备注</th></tr></thead>
+   <tbody id="stEntries"></tbody></table>
+   <div class="empty" id="stEmpty" style="display:none">暂无数据</div>
  </div>
 </section>
 </div>
@@ -1733,7 +1904,7 @@ function fmtRate(m){
   return s;
 }
 
-function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='settings')loadSettings();}
+function switchPanel(n){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.p===n));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.getElementById('panel-'+n).classList.add('active');if(n==='overview')loadOverview(true);if(n==='accounts')loadAccounts();if(n==='models')loadModels();if(n==='settings')loadSettings();if(n==='stats')loadStats();}
 function refreshAll(){loadOverview(true);loadAccounts();}
 function fmtT(v){if(!v)return '—';const t=new Date(v*1000);if(isNaN(t))return String(v);return t.toLocaleString('zh-CN',{hour12:false});}
 // stateBadge 渲染账号状态徽章 + 原因说明。
@@ -1811,10 +1982,13 @@ function refreshNow(){
   if(p==='overview')loadOverview(false);
   else if(p==='accounts')loadAccounts();
   else if(p==='models'){if(typeof loadModels==='function')loadModels();if(typeof loadFees==='function')loadFees();}
+  else if(p==='stats'){if(typeof loadStats==='function')loadStats();}
 }
 function startPoll(){
   if(pollTimer)clearInterval(pollTimer);
-  pollMs=(currentTab()==='models')?60000:30000;
+  // 统计/账本数据变化不快，与模型页同频（60s），避免无谓请求
+  var t=currentTab();
+  pollMs=(t==='models'||t==='stats')?60000:30000;
   pollTimer=setInterval(refreshNow,pollMs);
 }
 // 切 tab 时重置节奏（模型页更低频）
@@ -1993,7 +2167,92 @@ async function changeLogin(){const u=(document.getElementById('f_webui_user')||{
 async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
 opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
-loadOverview(true);showLoginUser();</script></body></html>"""
+loadOverview(true);showLoginUser();
+// ── 运行统计（第三个 tab）────────────────────────────────────
+// 数据来自两个后端接口：GET /api/stats（实时快照）与
+// GET /api/ledger?days=1|7（双流水账本）。两者刻意独立（上游 R43）：
+// stats 是"今日"实时口径，ledger 按 spend/expire 拆分流水；差值含积分包到期
+// 作废，两套数字天然不同，不可合并比较。
+var statsDays=1;
+function setStatsDays(n){
+  statsDays=(n===1?1:7);
+  var a=document.getElementById('statsDay1'),b=document.getElementById('statsDay7');
+  if(a)a.className='btn'+(statsDays===1?' btn-pri':'');
+  if(b)b.className='btn'+(statsDays===7?' btn-pri':'');
+  loadStats();
+}
+function stNum(v){return (v||0).toLocaleString();}
+// 纯 CSS 条形图（不引任何外部图表库 —— 面板运行在 HA ingress 后，不能依赖 CDN）
+function stBar(label,val,max){
+  var pct=max>0?Math.round((val/max)*100):0;
+  return '<div style="margin:6px 0"><div style="display:flex;justify-content:space-between;font-size:12px;color:var(--sub)"><span>'+esc(label)+'</span><span>'+stNum(val)+'</span></div>'
+    +'<div style="height:6px;background:var(--card3);border-radius:4px;overflow:hidden;margin-top:3px"><div style="height:100%;width:'+pct+'%;background:var(--pri);border-radius:4px"></div></div></div>';
+}
+async function loadStats(){
+  var hint=document.getElementById('stCards'),tk=document.getElementById('stTokens'),cd=document.getElementById('stCredit');
+  var pf=document.getElementById('stPlatforms'),md=document.getElementById('stModels'),en=document.getElementById('stEntries'),em=document.getElementById('stEmpty');
+  var hd=document.getElementById('statsHint');
+  try{
+    var d=await api('stats');
+    if(d.error){
+      if(hd)hd.textContent='统计不可用：'+d.error;
+      if(hint)hint.innerHTML='<div class="empty">'+esc(d.error)+'</div>';
+      return;
+    }
+    var tu=d.token_usage||{};
+    // 用量总览
+    if(hint)hint.innerHTML=[
+      {l:'总积分',v:stNum(d.total_credits),c:'good'},
+      {l:'账号总数',v:stNum(d.total_accounts),c:''},
+      {l:'今日请求',v:stNum(tu.req_today),c:''},
+      {l:'累计请求',v:stNum(tu.req_all),c:''},
+      {l:'7 日内临期',v:stNum(d.expiring_7d),c:(d.expiring_7d>0?'warn':'')},
+      {l:'今日到期',v:stNum(d.expire_today),c:(d.expire_today>0?'warn':'')}
+    ].map(function(c){return '<div class="stat"><div class="lbl">'+c.l+'</div><div class="val '+c.c+'">'+c.v+'</div></div>';}).join('');
+    // Token 用量（条形图，取最大值归一）
+    if(tk){
+      var tv=[['今日',tu.today],['近 7 日',tu.days7],['近 30 日',tu.days30],['累计',tu.all]];
+      var mx=0;tv.forEach(function(x){if(x[1]>mx)mx=x[1];});
+      tk.innerHTML=tv.map(function(x){return stBar(x[0],x[1],mx);}).join('');
+    }
+    // 积分流水
+    if(cd){
+      var cv=[['收入',d.credit_in],['消耗',d.credit_out],['过期',d.credit_expired]];
+      var cm=0;cv.forEach(function(x){if(x[1]>cm)cm=x[1];});
+      cd.innerHTML=cv.map(function(x){return stBar(x[0],x[1],cm);}).join('');
+    }
+    // 各渠道余额
+    var ps=d.platforms||[];
+    if(pf)pf.innerHTML=ps.length?ps.map(function(p){
+      return '<tr><td>'+esc(p.channel||p.group||'-')+'</td><td>'+esc(p.nickname||p.uid||'-')+'</td><td class="num">'+stNum(p.credits)+'</td><td class="num">'+stNum(p.tokens)+'</td><td>'+esc(p.reason||(p.cooling?'冷却中':(p.disabled?'已禁用':'正常')))+'</td></tr>';
+    }).join(''):'<tr><td colspan="5" style="text-align:center;color:var(--dim)">暂无数据</td></tr>';
+    // 模型消耗
+    var ms=d.models||[];
+    if(md){
+      var msum=0;ms.forEach(function(m){msum+=(m.credits||0);});
+      md.innerHTML=ms.length?ms.slice(0,20).map(function(m){
+        var pct=msum>0?Math.round((m.credits/msum)*100):0;
+        return '<tr><td>'+esc(m.model)+'</td><td class="num">'+stNum(m.credits)+'</td><td class="num">'+pct+'%</td></tr>';
+      }).join(''):'<tr><td colspan="3" style="text-align:center;color:var(--dim)">暂无数据</td></tr>';
+    }
+    // 账本流水
+    var lg=await api('ledger?days='+statsDays);
+    if(!lg.error&&lg.credit){
+      var es=(lg.credit.entries||[]).slice(-100);
+      if(en)en.innerHTML=es.length?es.map(function(e){
+        var k=(e.kind||'');
+        var cls=(k==='earn'?'b-ok':(k==='spend'?'b-warn':'b-bad'));
+        return '<tr><td>'+esc(String(e.ts||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.ch||'-')+'</td><td>'+esc((lg.credit.name_map||{})[e.uid]||e.uid||'-')+'</td>'
+          +'<td><span class="badge '+cls+'">'+esc(k)+'</span></td><td class="num">'+stNum(Math.abs(e.amount||0))+'</td><td class="num">'+stNum(e.balance)+'</td><td>'+esc(e.note||'')+'</td></tr>';
+      }).join(''):'';
+      if(em)em.style.display=es.length?'none':'block';
+    }
+    if(hd)hd.textContent='更新于 '+new Date().toLocaleTimeString();
+  }catch(e){
+    if(hd)hd.textContent='加载失败：'+e.message;
+  }
+}
+</script></body></html>"""
 
 
 # ---------------------------------------------------------------------------
