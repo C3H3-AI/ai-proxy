@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/rockswang/workbuddy-wild/internal/idle"
 	"io"
 	"log"
 	"net/http"
@@ -21,9 +22,6 @@ var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "ses
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) provider.ErrKind {
 	lower := strings.ToLower(body)
-	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
-		return provider.ErrHardCredit
-	}
 	if status == http.StatusUnauthorized {
 		for _, m := range sessionDeadMarkers {
 			if strings.Contains(lower, strings.ToLower(m)) {
@@ -50,6 +48,14 @@ func Classify(status int, body string) provider.ErrKind {
 	}
 	if status >= 500 {
 		return provider.ErrServer
+	}
+
+	// 状态码优先于 body 硬余额标记：429/401 的响应体也会携带业务码 1005
+	// （上游报错格式不受本端控制）。先判 1005 会把限流/登录失效误判成硬余额，
+	// 触发 12h 硬冷却，且 401 会绕过 ErrSessionDead 自愈重登。
+	// 故 1005 必须排在上面这些状态码之后（对齐上游 b890d3f）。
+	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
+		return provider.ErrHardCredit
 	}
 	if status >= 400 {
 		return provider.ErrClient
@@ -187,19 +193,27 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if c.StreamHTTP != nil {
 		hc = c.StreamHTTP
 	}
+	// 流中空闲监控：StreamHTTP 刻意不设总超时（支持长回答），
+	// 但上游连上后中途卡死会让请求无限期挂起，连接与 goroutine 无法释放
+	// （多账号池表现为「账号都在，却一直无可用账号」）。
+	// 这里给请求挂可取消 ctx，并对返回 body 加空闲监控：静默超过阈值即主动断流。
+	req, cancel := idle.WithCancel(req)
 	resp, err := hc.Do(req)
 	if err != nil {
+		cancel()
 		log.Printf("traework chat_stream uid=%s: transport error: %v", a.UIDValue(), err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("traework chat_stream uid=%s: upstream %d %s body=%s", a.UIDValue(), resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 成功路径：body 的 Close 会停掉监控并 cancel（见 idle.monitoringBody.Close）
+	return idle.Monitor(cancel, resp.Body, idle.DefaultTimeout), resp.StatusCode, nil, nil
 }
 
 func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
@@ -540,13 +554,13 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 				Quota struct {
 					CreditsLimit float64 `json:"credits_limit"`
 				}
-				PackageName   string `json:"package_name"`
-				PackageType   string `json:"package_type"`
+				PackageName string `json:"package_name"`
+				PackageType string `json:"package_type"`
 			} `json:"entitlement_base_info"`
-			DisplayDesc   string `json:"display_desc"`
-			GroupName     string `json:"group_name"`
-			GroupType     int    `json:"group_type"`
-			Usage struct {
+			DisplayDesc string `json:"display_desc"`
+			GroupName   string `json:"group_name"`
+			GroupType   int    `json:"group_type"`
+			Usage       struct {
 				CreditsAmount float64 `json:"credits_amount"`
 			} `json:"usage"`
 		} `json:"user_entitlement_pack_list"`
@@ -560,7 +574,9 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 		limit := int64(p.EntitlementBaseInfo.Quota.CreditsLimit)
 		used := int64(p.Usage.CreditsAmount)
 		remain := limit - used
-		if remain < 0 { remain = 0 }
+		if remain < 0 {
+			remain = 0
+		}
 		total += remain
 		// 优先使用 group_name（如"每日签到"、"每月登录积分"），其次 display_desc，最后兜底
 		name := p.GroupName
