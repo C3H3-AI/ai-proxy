@@ -1659,7 +1659,6 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
 <button class="tab" data-p="models" onclick="switchPanel('models')">模型</button>
 <button class="tab" data-p="stats" onclick="switchPanel('stats')">运行统计</button>
 <button class="tab" data-p="settings" onclick="switchPanel('settings')">设置</button>
-<button class="tab" data-p="stats" onclick="switchPanel('stats')">运行统计</button>
 </nav>
 <div class="toast" id="toastBox"></div>
 
@@ -1823,37 +1822,6 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
   </div>
   <div class="tbar"><button class="btn btn-ok" onclick="saveSettings()">保存设置</button>
   <button class="btn btn-pri" onclick="loadSettings()">重新加载</button></div>
- </div>
-</section>
-<section class="panel" id="panel-stats">
- <div class="box">
-   <div class="tbar"><div class="grp">
-     <button class="btn btn-info" onclick="loadStats()">立即刷新</button>
-     <button class="btn" id="statsDay1" onclick="setStatsDays(1)">今日</button>
-     <button class="btn btn-pri" id="statsDay7" onclick="setStatsDays(7)">近 7 日</button>
-   </div><span class="hint" id="statsHint">加载中…</span></div>
-
-   <div class="subhead">用量总览</div>
-   <div class="cards" id="stCards"></div>
-
-   <div class="subhead">Token 用量</div>
-   <div class="cards" id="stTokens"></div>
-
-   <div class="subhead">积分流水（收入 / 消耗 / 过期）</div>
-   <div class="cards" id="stCredit"></div>
-
-   <div class="subhead">各渠道余额</div>
-   <table><thead><tr><th>渠道</th><th>账号</th><th>积分</th><th>Token</th><th>状态</th></tr></thead>
-   <tbody id="stPlatforms"></tbody></table>
-
-   <div class="subhead">模型消耗排行</div>
-   <table><thead><tr><th>模型</th><th>积分</th><th>占比</th></tr></thead>
-   <tbody id="stModels"></tbody></table>
-
-   <div class="subhead">账本流水（最近条目，时间升序）</div>
-   <table><thead><tr><th>时间</th><th>渠道</th><th>账号</th><th>类型</th><th>金额</th><th>余额</th><th>备注</th></tr></thead>
-   <tbody id="stEntries"></tbody></table>
-   <div class="empty" id="stEmpty" style="display:none">暂无数据</div>
  </div>
 </section>
 </div>
@@ -2168,89 +2136,251 @@ async function saveSettings(){const opt={};const get=id=>document.getElementById
 opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
 loadOverview(true);showLoginUser();
-// ── 运行统计（第三个 tab）────────────────────────────────────
-// 数据来自两个后端接口：GET /api/stats（实时快照）与
-// GET /api/ledger?days=1|7（双流水账本）。两者刻意独立（上游 R43）：
-// stats 是"今日"实时口径，ledger 按 spend/expire 拆分流水；差值含积分包到期
-// 作废，两套数字天然不同，不可合并比较。
+// ══ 运行统计（第三个 tab）══════════════════════════════════════
+//
+// 数据来自两个后端接口（都由 login_ui.py 的 Python 侧转发并注入 api_key：
+// serverd 的 /api/stats 与 /api/ledger 走 withAuth，配了 api_key 时
+// 前端直连会 401，前端 api() helper 不带鉴权头）。
+//
+//   - GET wb-api/stats        运行统计快照（今日实时内存口径）
+//   - GET wb-api/ledger?days=N 双流水账本（磁盘流水按窗口聚合）
+//
+// 两套数字刻意独立、不可合并比较（上游 R43）：stats 的「消耗」是余额下降
+// 差值（含积分包到期作废），ledger 把它拆成 spend / expire 两类。
+// 所以页面分区展示：Token 用量与临期取 stats，积分收支流水取 ledger。
+//
+// ⚠️ 字段口径以 Go json tag 为准（backend checker 已核对源码）：
+//   stats:  token_usage{today,days7,days30,all,req_today,req_all,days}
+//           platforms[]{group,accounts,credits,credit_in,credit_out,
+//                       credit_expired,credit_used,tokens,expire_7d,
+//                       expire_today,expire_tomorrow}
+//           models[]{model,reqs,tokens,credit,avg_ttfb_ms,avg_tok_per_sec,
+//                    perf_samples}           ← 注意：stats 的模型行没有 channel
+//           expiry[]{uid,nickname,group,expire_at,days_left,amount,
+//                    today_out,burn_forecast,risk}
+//   ledger: credit{earn,spend,expire,entries[],name_map}
+//           条目：ts/uid/channel/kind/amount/balance/note
+//           ← 注意：API 里是 channel（磁盘 JSONL 的字段名才是 ch）
+//
+// 图表：纯 CSS 横向条形图（.bar/.barrow），面板经 HA ingress 加载，
+// 不能依赖 echarts 或任何外部 CDN/npm 包。
 var statsDays=1;
-function setStatsDays(n){
+
+function setLedgerDays(n){
   statsDays=(n===1?1:7);
-  var a=document.getElementById('statsDay1'),b=document.getElementById('statsDay7');
-  if(a)a.className='btn'+(statsDays===1?' btn-pri':'');
-  if(b)b.className='btn'+(statsDays===7?' btn-pri':'');
-  loadStats();
+  document.querySelectorAll('#ledgerSeg button').forEach(function(b){
+    b.classList.toggle('on', Number(b.dataset.d)===statsDays);
+  });
+  return loadStats();
 }
-function stNum(v){return (v||0).toLocaleString();}
-// 纯 CSS 条形图（不引任何外部图表库 —— 面板运行在 HA ingress 后，不能依赖 CDN）
-function stBar(label,val,max){
-  var pct=max>0?Math.round((val/max)*100):0;
-  return '<div style="margin:6px 0"><div style="display:flex;justify-content:space-between;font-size:12px;color:var(--sub)"><span>'+esc(label)+'</span><span>'+stNum(val)+'</span></div>'
-    +'<div style="height:6px;background:var(--card3);border-radius:4px;overflow:hidden;margin-top:3px"><div style="height:100%;width:'+pct+'%;background:var(--pri);border-radius:4px"></div></div></div>';
+function stNum(v){return (Number(v)||0).toLocaleString();}
+function fmtTs(ts){
+  var t=new Date((Number(ts)||0)*1000);
+  if(isNaN(t.getTime())||!ts)return '—';
+  var p=function(x){return (x<10?'0':'')+x;};
+  return (t.getMonth()+1)+'-'+p(t.getDate())+' '+p(t.getHours())+':'+p(t.getMinutes())+':'+p(t.getSeconds());
 }
-async function loadStats(){
-  var hint=document.getElementById('stCards'),tk=document.getElementById('stTokens'),cd=document.getElementById('stCredit');
-  var pf=document.getElementById('stPlatforms'),md=document.getElementById('stModels'),en=document.getElementById('stEntries'),em=document.getElementById('stEmpty');
-  var hd=document.getElementById('statsHint');
-  try{
-    var d=await api('stats');
-    if(d.error){
-      if(hd)hd.textContent='统计不可用：'+d.error;
-      if(hint)hint.innerHTML='<div class="empty">'+esc(d.error)+'</div>';
-      return;
-    }
-    var tu=d.token_usage||{};
-    // 用量总览
-    if(hint)hint.innerHTML=[
-      {l:'总积分',v:stNum(d.total_credits),c:'good'},
-      {l:'账号总数',v:stNum(d.total_accounts),c:''},
-      {l:'今日请求',v:stNum(tu.req_today),c:''},
-      {l:'累计请求',v:stNum(tu.req_all),c:''},
-      {l:'7 日内临期',v:stNum(d.expiring_7d),c:(d.expiring_7d>0?'warn':'')},
-      {l:'今日到期',v:stNum(d.expire_today),c:(d.expire_today>0?'warn':'')}
-    ].map(function(c){return '<div class="stat"><div class="lbl">'+c.l+'</div><div class="val '+c.c+'">'+c.v+'</div></div>';}).join('');
-    // Token 用量（条形图，取最大值归一）
-    if(tk){
-      var tv=[['今日',tu.today],['近 7 日',tu.days7],['近 30 日',tu.days30],['累计',tu.all]];
-      var mx=0;tv.forEach(function(x){if(x[1]>mx)mx=x[1];});
-      tk.innerHTML=tv.map(function(x){return stBar(x[0],x[1],mx);}).join('');
-    }
-    // 积分流水
-    if(cd){
-      var cv=[['收入',d.credit_in],['消耗',d.credit_out],['过期',d.credit_expired]];
-      var cm=0;cv.forEach(function(x){if(x[1]>cm)cm=x[1];});
-      cd.innerHTML=cv.map(function(x){return stBar(x[0],x[1],cm);}).join('');
-    }
-    // 各渠道余额
-    var ps=d.platforms||[];
-    if(pf)pf.innerHTML=ps.length?ps.map(function(p){
-      return '<tr><td>'+esc(p.channel||p.group||'-')+'</td><td>'+esc(p.nickname||p.uid||'-')+'</td><td class="num">'+stNum(p.credits)+'</td><td class="num">'+stNum(p.tokens)+'</td><td>'+esc(p.reason||(p.cooling?'冷却中':(p.disabled?'已禁用':'正常')))+'</td></tr>';
-    }).join(''):'<tr><td colspan="5" style="text-align:center;color:var(--dim)">暂无数据</td></tr>';
-    // 模型消耗
-    var ms=d.models||[];
-    if(md){
-      var msum=0;ms.forEach(function(m){msum+=(m.credits||0);});
-      md.innerHTML=ms.length?ms.slice(0,20).map(function(m){
-        var pct=msum>0?Math.round((m.credits/msum)*100):0;
-        return '<tr><td>'+esc(m.model)+'</td><td class="num">'+stNum(m.credits)+'</td><td class="num">'+pct+'%</td></tr>';
-      }).join(''):'<tr><td colspan="3" style="text-align:center;color:var(--dim)">暂无数据</td></tr>';
-    }
-    // 账本流水
-    var lg=await api('ledger?days='+statsDays);
-    if(!lg.error&&lg.credit){
-      var es=(lg.credit.entries||[]).slice(-100);
-      if(en)en.innerHTML=es.length?es.map(function(e){
-        var k=(e.kind||'');
-        var cls=(k==='earn'?'b-ok':(k==='spend'?'b-warn':'b-bad'));
-        return '<tr><td>'+esc(String(e.ts||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.ch||'-')+'</td><td>'+esc((lg.credit.name_map||{})[e.uid]||e.uid||'-')+'</td>'
-          +'<td><span class="badge '+cls+'">'+esc(k)+'</span></td><td class="num">'+stNum(Math.abs(e.amount||0))+'</td><td class="num">'+stNum(e.balance)+'</td><td>'+esc(e.note||'')+'</td></tr>';
-      }).join(''):'';
-      if(em)em.style.display=es.length?'none':'block';
-    }
-    if(hd)hd.textContent='更新于 '+new Date().toLocaleTimeString();
-  }catch(e){
-    if(hd)hd.textContent='加载失败：'+e.message;
+// 条形榜行：标签 | 轨道 | 数值。max<=0 时退化为 0 宽（避免除零）
+function barRow(label,val,max,cls,tip){
+  var pct=max>0?Math.round((Number(val)||0)/max*100):0;
+  if(pct>100)pct=100;
+  return '<div class="barrow'+(tip?' mut':'')+'">'
+    +'<div class="nm" title="'+esc(tip||label)+'">'+esc(label)+'</div>'
+    +'<div class="bar '+(cls||'')+'"><i style="width:'+pct+'%"></i></div>'
+    +'<div class="vv">'+stNum(val)+'</div></div>';
+}
+function bars(rows,cls){
+  var mx=0;
+  rows.forEach(function(r){var v=Number(r[1])||0;if(v>mx)mx=v;});
+  if(mx<=0){
+    // 全 0：仍要渲染行（让用户看到维度），宽度为 0
+    return rows.map(function(r){return barRow(r[0],r[1],0,cls,r[2]);}).join('');
   }
+  return rows.map(function(r){return barRow(r[0],r[1],mx,cls,r[2]);}).join('');
+}
+const CH_NAME={workbuddy:'WorkBuddy',traework:'TraeWork',qoder:'Qoder'};
+function chName(c){return CH_NAME[String(c||'').toLowerCase()]||String(c||'—');}
+function chOf(row){return chName(row.group||row.channel||row.ch);}
+
+async function loadStats(){
+  const info=document.getElementById('statsInfo');
+  const setHTML=function(id,html){const el=document.getElementById(id);if(el)el.innerHTML=html;};
+  const setText=function(id,t){const el=document.getElementById(id);if(el)el.textContent=t;};
+  const errBox=function(msg){
+    if(info)info.textContent='统计暂不可用';
+    ['stCards','stTokens','stCredit','stPlatforms','stModels','stExpiry'].forEach(function(id){
+      setHTML(id,'<div class="empty" style="padding:20px">'+esc(msg)+'</div>');
+    });
+    setHTML('stLedgerBody','');
+    const em=document.getElementById('stLedgerEmpty');if(em){em.style.display='block';em.textContent=msg;}
+    setText('stLedgerCount','');
+    ['stTokensHint','stCreditHint','stExpiryHint'].forEach(function(id){setText(id,'');});
+  };
+  let d;
+  try{
+    d=await api('stats');
+  }catch(e){
+    errBox('无法连接统计接口：'+e.message);
+    return;
+  }
+  if(d.error||d.status){
+    // 后端返回 OpenAI 错误结构（如 stats_unavailable）：文案里已说明不影响转发
+    const msg=(d.error&&(d.error.message||d.error))||('统计接口 HTTP '+(d.status||'异常'));
+    errBox(msg);
+    return;
+  }
+  const tu=d.token_usage||{};
+
+  // ── 概览卡片 ──
+  setHTML('stCards',[
+    {l:'总积分',v:stNum(d.total_credits),c:'good'},
+    {l:'账号总数',v:stNum(d.total_accounts),c:''},
+    {l:'今日 Token',v:stNum(tu.today),c:''},
+    {l:'今日请求',v:stNum(tu.req_today),c:''},
+    {l:'7 日内临期',v:stNum(d.expiring_7d),c:(d.expiring_7d>0?'warn':'')},
+    {l:'今日到期',v:stNum(d.expire_today),c:(d.expire_today>0?'warn':'')}
+  ].map(function(c){return '<div class="stat"><div class="lbl">'+c.l+'</div><div class="val '+c.c+'">'+c.v+'</div></div>';}).join(''));
+
+  // ── Token 用量（今日 / 7 日 / 30 日 / 累计）──
+  setHTML('stTokens',bars([
+    ['今日',tu.today,'内存今日实时口径'],
+    ['近 7 日',tu.days7,'今日 + 前 6 天归档'],
+    ['近 30 日',tu.days30,'今日 + 前 29 天归档'],
+    ['累计',tu.all,'有记录以来的全部']
+  ],'cy'));
+  setText('stTokensHint','今日请求 '+stNum(tu.req_today)+' 次，累计 '+stNum(tu.req_all)
+    +' 次'+(tu.days?('（已记录 '+tu.days+' 天）'):'')
+    +'。今日颗粒几分钟更新一次，多日窗口为跨天归档值。');
+
+  // ── 渠道余额分布 ──
+  const ps=d.platforms||[];
+  if(!ps.length){
+    setHTML('stPlatforms','<div class="empty" style="padding:20px">暂无渠道数据</div>');
+  }else{
+    const mx=ps.reduce(function(m,p){return Math.max(m,Number(p.credits)||0);},0);
+    setHTML('stPlatforms',ps.map(function(p){
+      const sub=stNum(p.accounts)+' 个账号 · 今日 '+stNum(p.tokens)+' tokens';
+      return '<div class="barrow"><div class="nm">'+esc(chOf(p))
+        +'<div class="hint" style="font-size:11px">'+esc(sub)+'</div></div>'
+        +'<div class="bar"><i style="width:'+(mx>0?Math.round((Number(p.credits)||0)/mx*100):0)+'%"></i></div>'
+        +'<div class="vv">'+stNum(p.credits)+'</div></div>';
+    }).join(''));
+  }
+
+  // ── 模型消耗排行（前 10，按 credit 降序）──
+  const ms=(d.models||[]).slice().sort(function(a,b){
+    return (Number(b.credit)||0)-(Number(a.credit)||0);
+  }).slice(0,10);
+  if(!ms.length){
+    setHTML('stModels','<div class="empty" style="padding:20px">今日暂无模型消耗</div>');
+  }else{
+    const mx=ms.reduce(function(m,x){return Math.max(m,Number(x.credit)||0);},0);
+    setHTML('stModels',ms.map(function(m){
+      const tip=stNum(m.reqs)+' 次请求 · '+stNum(m.tokens)+' tokens';
+      return '<div class="barrow"><div class="nm" title="'+esc(tip)+'">'+esc(m.model)
+        +'<div class="hint" style="font-size:11px">'+esc(tip)+'</div></div>'
+        +'<div class="bar"><i style="width:'+(mx>0?Math.round((Number(m.credit)||0)/mx*100):0)+'%"></i></div>'
+        +'<div class="vv">'+(Number(m.credit)||0).toLocaleString(undefined,{maximumFractionDigits:2})+'</div></div>';
+    }).join(''));
+  }
+
+  // ── 临期额度（7 日内）──
+  const ex=(d.expiry||[]).filter(function(e){return (e.days_left===undefined)||(Number(e.days_left)<=7);});
+  if(!ex.length){
+    setHTML('stExpiry','<div class="empty" style="padding:20px">7 日内无临期额度</div>');
+    setText('stExpiryHint','');
+  }else{
+    const mx=ex.reduce(function(m,e){return Math.max(m,Number(e.amount)||0);},0);
+    setHTML('stExpiry',ex.slice(0,10).map(function(e){
+      const left=Number(e.days_left);
+      const cls=(Number(e.risk)||left<=1)?'bad':(left<=3?'':'ok');
+      const nm=(e.nickname||e.uid||'—')+' · '+chOf(e);
+      const sub=e.expire_at+' 到期（'+(left<=0?'今日':('还剩 '+left+' 天'))+'）';
+      return '<div class="barrow"><div class="nm">'+esc(nm)
+        +'<div class="hint" style="font-size:11px">'+esc(sub)+'</div></div>'
+        +'<div class="bar '+cls+'"><i style="width:'+(mx>0?Math.round((Number(e.amount)||0)/mx*100):0)+'%"></i></div>'
+        +'<div class="vv">'+stNum(e.amount)+'</div></div>';
+    }).join(''));
+    setText('stExpiryHint','合计 '+stNum(d.expiring_7d)+' 分'
+      +((d.expiring_7d_accts)?('，涉及 '+stNum(d.expiring_7d_accts)+' 个账号'):'')
+      +'；今日到期 '+stNum(d.expire_today)+' 分，明日 '+stNum(d.expire_tomorrow)+' 分。');
+  }
+
+  // ── 账本双流水 ──
+  let lg;
+  try{
+    lg=await api('ledger?days='+statsDays);
+  }catch(e){
+    lg={error:'无法连接账本接口：'+e.message};
+  }
+  const cr=(lg&&lg.credit)||null;
+  if(lg&&(lg.error||lg.status)){
+    const msg=(lg.error&&(lg.error.message||lg.error))||('账本接口 HTTP '+(lg.status||'异常'));
+    setHTML('stCredit','<div class="empty" style="padding:20px">'+esc(msg)+'</div>');
+    setText('stCreditHint','');
+    setHTML('stLedgerBody','');
+    const em=document.getElementById('stLedgerEmpty');if(em){em.style.display='block';em.textContent=msg;}
+    setText('stLedgerCount','');
+  }else if(cr){
+    const rows=[
+      ['收入 earn',cr.earn,''],
+      ['消耗 spend',cr.spend,''],
+      ['过期 expire',cr.expire,'']
+    ];
+    setHTML('stCredit',rows.map(function(r,k){
+      const mx=Math.max(Number(cr.earn)||0,Number(cr.spend)||0,Number(cr.expire)||0);
+      const pct=mx>0?Math.round((Number(r[1])||0)/mx*100):0;
+      const cls=k===0?'ok':(k===1?'':'bad');
+      return '<div class="barrow"><div class="nm"><span class="kd '+(k===0?'earn':(k===1?'spend':'expire'))+'">'+esc(r[0])+'</span></div>'
+        +'<div class="bar '+cls+'"><i style="width:'+pct+'%"></i></div>'
+        +'<div class="vv">'+stNum(r[1])+'</div></div>';
+    }).join(''));
+    const tk=(lg.token)||{};
+    setText('stCreditHint',(statsDays===1?'今日':'近 7 日')+'窗口：收入 '+stNum(cr.earn)
+      +' / 消耗 '+stNum(cr.spend)+' / 过期 '+stNum(cr.expire)+' 分'
+      +((tk.requests!==undefined)?('；成功请求 '+stNum(tk.requests)+' 次、'+stNum(tk.total)+' tokens'):'')
+      +'。与概览卡片的「今日消耗」不是同一口径：stats 按余额下降差值记账，'
+      +'到期作废混在里面；账本把它单独拆成 expire，所以 spend 通常小于 stats 的消耗。');
+
+    // 流水列表：后端已按时间升序，面板看最新在前，故倒序展示
+    const nm=cr.name_map||{};
+    const es=(cr.entries||[]).slice().reverse();
+    const body=document.getElementById('stLedgerBody');
+    const emp=document.getElementById('stLedgerEmpty');
+    if(body){
+      // 上限 200 行：7 日窗口条目可达数千，全量插入会让面板卡顿，
+      // 且 HA ingress 侧边栏本身也不适合翻几千行流水。
+      const shown=es.slice(0,200);
+      body.innerHTML=shown.map(function(e){
+        const k=String(e.kind||'');
+        // amount 自带方向（正=入项，负=消耗/过期），原样显示不取绝对值：
+        // 类型色点是辅助，金额符号才是流水表该有的第一判据。
+        const amt=(Number(e.amount)||0).toLocaleString();
+        // ⚠️ 引号坑：属性一律 esc() + HTML 实体，不要用 JSON.stringify
+        // —— 它产出的双引号会提前闭合 onclick="..." 属性（历史事故：复制按钮失效）。
+        return '<tr><td class="num">'+esc(fmtTs(e.ts))+'</td>'
+          +'<td>'+esc(nm[e.uid]||e.uid||'—')+'</td>'
+          +'<td>'+esc(chOf(e))+'</td>'
+          +'<td><span class="kd '+esc(k)+'">'+esc(k||'—')+'</span></td>'
+          +'<td class="num">'+((Number(e.amount)||0)>0?'+':'')+esc(amt)+'</td>'
+          +'<td class="num">'+stNum(e.balance)+'</td>'
+          +'<td class="hint">'+esc(e.note||'')+'</td></tr>';
+      }).join('');
+    }
+    if(emp)emp.style.display=es.length?'none':'block';
+    setText('stLedgerCount','共 '+stNum(es.length)+' 条'
+      +(es.length>200?('（显示最近 200 条）'):'')
+      +' · '+(statsDays===1?'今日':'近 7 日')+' · 倒序（最新在上）');
+  }else{
+    setHTML('stCredit','<div class="empty" style="padding:20px">账本暂无数据</div>');
+    setText('stCreditHint','');
+    setHTML('stLedgerBody','');
+    const em=document.getElementById('stLedgerEmpty');if(em){em.style.display='block';em.textContent='账本暂无数据';}
+    setText('stLedgerCount','');
+  }
+
+  setText('statsInfo','更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false})
+    +' · 每 60s 自动刷新');
 }
 </script></body></html>"""
 
