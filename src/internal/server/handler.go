@@ -146,11 +146,13 @@ func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
 // freeModel=false 表示付费模型：仅高积分（非低积分）账号可用。
 // freeModel=true  表示 0 费率模型：高积分与低积分账号均可用，优先选取低积分账号，
 //                  无低积分账号时回退到高积分账号。
+// model 为本次请求的模型键；用于过滤【模型级冷却】（429/6004 上游按模型限额时，
+// 该账号可能只对某些模型冷却、对其他模型仍可用 —— 见 Pool.CooldownModel）。
 // 优先使用上次成功路由的账号，直到：
-//   - 账号进入冷却/禁用/未被当前模型模式允许
+//   - 账号进入冷却/禁用/未被当前模型模式允许/对该模型处于模型级冷却
 //   - 连续成功请求达到 maxReqs 次（默认 50），自动轮换
 // 任一条件触发则降级选新账号并重置粘性记录。
-func (h *Handler) pickWithSticky(rt *Runtime, freeModel bool) *auth.Auth {
+func (h *Handler) pickWithSticky(rt *Runtime, freeModel bool, model string) *auth.Auth {
 	const defaultMaxReqs = 50
 
 	// ⚠️ 必须在锁内把字段**拷贝出来**，不能只取指针。
@@ -169,12 +171,15 @@ func (h *Handler) pickWithSticky(rt *Runtime, freeModel bool) *auth.Auth {
 	}
 	h.stickyMu.RUnlock()
 
-	// 尝试粘性路由：账号必须健康，且对当前模型模式可用（付费模型要求非低积分）
+	// 尝试粘性路由：账号必须健康，且对当前模型模式可用（付费模型要求非低积分），
+	// 且对该模型不处于模型级冷却
 	if uid != "" && reqCount < maxReqs {
 		acct := rt.Pool.AuthByUID(uid)
 		if acct != nil {
 			status, ok := rt.Pool.Status(uid)
-			if ok && !status.Cooling && !status.Disabled && (freeModel || !status.LowCredit) {
+			modelCooled := ok && model != "" && status.ModelCooling != nil &&
+				status.ModelCooling[model].After(time.Now())
+			if ok && !status.Cooling && !status.Disabled && !modelCooled && (freeModel || !status.LowCredit) {
 				log.Printf("sticky route platform=%s uid=%s count=%d/%d free_model=%v",
 					rt.Kind, uid, reqCount, maxReqs, freeModel)
 				return acct
@@ -182,15 +187,15 @@ func (h *Handler) pickWithSticky(rt *Runtime, freeModel bool) *auth.Auth {
 		}
 	}
 
-	// 降级：选择账号
+	// 降级：选择账号（排除对该模型处于模型级冷却的账号）
 	var acct *auth.Auth
 	if freeModel {
-		acct = rt.Pool.PickLowCredit() // 0 费率模型优先消耗低积分账号
+		acct = rt.Pool.PickLowCreditForModel(nil, model) // 0 费率模型优先消耗低积分账号
 		if acct == nil {
-			acct = rt.Pool.Pick() // 无低积分账号时退回高积分账号
+			acct = rt.Pool.PickForModel(model) // 无低积分账号时退回高积分账号
 		}
 	} else {
-		acct = rt.Pool.Pick()
+		acct = rt.Pool.PickForModel(model)
 	}
 	if acct == nil {
 		return nil
@@ -523,8 +528,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	// 最后一次上游错误的原始 status+body：候选耗尽时原样透传（而非包装成 503），
+	// 客户端才能看到 6004 重置时间等上游细节。
+	var lastStatus int
+	var lastBody []byte
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.pickWithSticky(rt, freeModel)
+		acct := h.pickWithSticky(rt, freeModel, model)
 		if acct == nil {
 			break
 		}
@@ -532,12 +541,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 粘性路由选回已尝试的账号，清除粘性记录后降级重选
 			h.stickyClear(rt)
 			if freeModel {
-				acct = rt.Pool.PickExcludingLowCredit(tried)
+				acct = rt.Pool.PickLowCreditForModel(tried, model)
 				if acct == nil {
-					acct = rt.Pool.PickExcluding(tried)
+					acct = rt.Pool.PickExcludingForModel(tried, model)
 				}
 			} else {
-				acct = rt.Pool.PickExcluding(tried)
+				acct = rt.Pool.PickExcludingForModel(tried, model)
 			}
 			if acct == nil {
 				break
@@ -575,9 +584,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if status >= 400 {
 			kind := rt.Upstream.Classify(status, string(respBody))
-			h.applyUpstreamError(rt, acct.UID, kind, freeModel)
+			h.applyUpstreamError(rt, acct.UID, kind, freeModel, respBody, model)
 			h.stickyClear(rt)
 			lastErr = &provider.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			// 请求级错误（内容拦截 / 上下文超限等）：换任何账号都必然复现，
+			// 立刻透传上游原文，不再无效轮转消耗其他账号配额。
+			if !kind.Rotatable() {
+				log.Printf("transparent platform=%s uid=%s kind=%s status=%d body=%s",
+					rt.Kind, acct.UID, kind, status, truncateBody(respBody))
+				transparentError(w, status, respBody)
+				return
+			}
+			lastStatus = status
+			lastBody = respBody
 			continue
 		}
 		defer rc.Close()
@@ -593,7 +612,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if ue, ok := serr.(*provider.Error); ok {
 					log.Printf("stream error platform=%s uid=%s kind=%s msg=%s",
 						rt.Kind, acct.UID, ue.Kind, ue.Msg)
-					h.applyUpstreamError(rt, acct.UID, ue.Kind, freeModel)
+					h.applyUpstreamError(rt, acct.UID, ue.Kind, freeModel, []byte(ue.Msg), model)
 				} else {
 					log.Printf("stream i/o error platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
 				}
@@ -612,6 +631,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rt.Pool.NoteSuccess(acct.UID)
 		h.stickySuccess(rt)
 		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	// 候选耗尽但轮换中确有上游错误：优先透传最后一个上游原始响应，
+	// 保持上游语义（如 429 + 6004 重置时间）。本次请求确实逐号尝试过，
+	// 包装成 503 反而丢信息，客户端不知道何时可重试。
+	if lastStatus > 0 && lastBody != nil {
+		transparentError(w, lastStatus, lastBody)
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
@@ -633,7 +659,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //
 // freeModel 表示本次请求是否为 0 费率（免费）模型，用于区分「免费额度用完」的
 // 惩罚力度：免费模型失败只需换号重试，不该把账号冷却到次日。
-func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrKind, freeModel bool) {
+// body 为上游原始响应体（可能为 nil）：仅用于 429 时解析 6004 的真实重置时间；
+// 不影响其他错误类别的处理。
+// model 为本次请求的模型键：仅用于 429 时做【模型级冷却】；
+// 为空时退化为整号冷却。
+func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrKind, freeModel bool, body []byte, model string) {
 	switch kind {
 	case provider.ErrHardCredit:
 		// 依据账号实际状态，而非模型费率，判断是否属于「免费额度已用完」：
@@ -653,7 +683,23 @@ func (h *Handler) applyUpstreamError(rt *Runtime, uid string, kind provider.ErrK
 			rt.Pool.Cooldown(uid, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
 		}
 	case provider.ErrSoftRate:
-		rt.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+		// 429/6004 上游常按【模型】限额（响应里会提示"您也可以切换其他模型继续使用"），
+		// 此时账号整体仍健康 —— 只冷却撞墙的模型，同号其他模型继续参与选号。
+		// 若短时间内第二个模型也撞墙，CooldownModel 会升级为整号冷却
+		// （防上游其实是按账号计时，逐个模型试探会拖垮账号）。
+		//
+		// 若响应含 6004「将在 <ts> 重置」，按真实重置点冷却；否则回退默认 SoftCooldown。
+		d := h.softRateCooldown(string(body))
+		if model != "" {
+			if escalated := rt.Pool.CooldownModel(uid, model, d, "429 rate limit"); escalated {
+				log.Printf("model cooldown escalated to account platform=%s uid=%s model=%s",
+					rt.Kind, uid, model)
+			} else {
+				log.Printf("model cooldown platform=%s uid=%s model=%s", rt.Kind, uid, model)
+			}
+		} else {
+			rt.Pool.Cooldown(uid, pool.CoolSoft, d, "429 rate limit")
+		}
 	case provider.ErrSessionDead:
 		rt.Pool.Disable(uid, "session dead")
 	case provider.ErrNotFound:
@@ -827,6 +873,84 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
+}
+
+// transparentError 把上游响应【原样】回写给客户端（保留上游 status 与 body）。
+//
+// 用于两类场景（移植自上游 wild-work PR #82 的思路）：
+//   1. 请求级错误（内容拦截 / 上下文超限）：换任何账号都必然复现，
+//      应立刻把上游原文给客户端，而不是轮转到耗尽后包装成 503；
+//   2. 候选全部耗尽：本次确实逐号尝试过，包装成 503 会丢掉上游细节
+//      （如 429 + 6004 重置时间），客户端因此无法知道何时可重试。
+// softRateResetMaxCap 解析出的重置时长上限：
+// 上游时间戳异常（如错给一年后）时不至于把号冻死。
+const softRateResetMaxCap = 24 * time.Hour
+
+// softRateCooldown 从限流响应体提取【真实重置时间】，冷却到该时刻
+// （而非固定 SoftCooldown）。
+//
+// 移植自上游 wild-work PR #82（d4314a2）。
+//
+// 命中形态：WorkBuddy 6004「...将在 2026-09-23 14:47:19 UTC+8 重置...」
+//
+// 为什么必要：该类限流按重置点解封，固定 60s 软冷却过期后账号会被
+// 反复选中、反复 429 —— 表现为"解禁了又限流"的循环。
+// 解析失败或时长为非正值时回退默认 SoftCooldown（不改变原有行为）。
+func (h *Handler) softRateCooldown(body string) time.Duration {
+	ts, ok := softRateResetTs(body)
+	if !ok {
+		return h.cfg.SoftCooldown
+	}
+	d := time.Until(ts)
+	if d <= 0 {
+		return h.cfg.SoftCooldown
+	}
+	if d > softRateResetMaxCap {
+		d = softRateResetMaxCap
+	}
+	return d
+}
+
+// softRateResetTs 提取「将在 <ts> 重置」中的时间戳（UTC+8 墙钟）；未命中返回 false。
+func softRateResetTs(body string) (time.Time, bool) {
+	const marker = "将在 "
+	i := strings.Index(body, marker)
+	if i < 0 {
+		return time.Time{}, false
+	}
+	rest := body[i+len(marker):]
+	end := strings.Index(rest, " 重置")
+	if end < 0 {
+		return time.Time{}, false
+	}
+	s := strings.TrimSpace(rest[:end])
+	// 「UTC+8」是时区说明而非时间的一部分（layout 无法解析），剥掉
+	if suffix := " UTC+8"; strings.HasSuffix(s, suffix) {
+		s = strings.TrimSuffix(s, suffix)
+	}
+	const layout = "2006-01-02 15:04:05"
+	loc := time.FixedZone("UTC+8", 8*3600)
+	reset, err := time.ParseInLocation(layout, s, loc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return reset, true
+}
+
+// truncateBody 日志用的响应体摘要（避免超长 body 淹没日志）。
+func truncateBody(body []byte) string {
+	const max = 200
+	s := string(body)
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
+}
+
+func transparentError(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {

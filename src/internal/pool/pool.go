@@ -1,5 +1,3 @@
-// Package pool 账号池：内存索引 + 冷却/禁用状态机 + state.json 持久化。
-// 挑选策略：healthy 账号中剩余积分最多者。
 package pool
 
 import (
@@ -47,6 +45,9 @@ type Status struct {
 	Disabled       bool      `json:"disabled"`
 	LowCredit      bool      `json:"low_credit"` // 积分低于阈值，仅限 0 费率模型
 	ErrCount       int       `json:"err_count,omitempty"`
+	// ModelCooling 账号在个别模型上的独立冷却（429/6004 按模型限，账号整体仍可用）。
+	// 仅包含仍处于未来的条目；空 = 无模型级冷却。供路由过滤与面板展示。
+	ModelCooling   map[string]time.Time `json:"model_cooling,omitempty"`
 	LastCheckinOK  bool      `json:"last_checkin_ok,omitempty"`
 	LastCheckinAt  time.Time `json:"last_checkin_at,omitempty"`
 	LastCheckinMsg string    `json:"last_checkin_msg,omitempty"`
@@ -60,6 +61,14 @@ type entry struct {
 	reason   string
 	until    time.Time
 	errCount int
+	// modelCool 模型级冷却：model → 解冻时刻。
+	//
+	// 429/6004 上游常按【模型】限额（响应里会提示"您也可以切换其他模型继续使用"），
+	// 此时账号整体仍健康 —— 只冷却撞墙的模型，同号其他模型继续参与选号。
+	// 若短时间内第二个模型也撞墙，CooldownModel 会升级为整号冷却
+	// （防上游其实是按账号计时、逐个模型试探会拖垮账号）。
+	// 条目过期后延迟清理（见 CooldownModel）。
+	modelCool map[string]time.Time
 
 	lastCheckinOK  bool
 	lastCheckinAt  time.Time
@@ -76,6 +85,19 @@ func (e *entry) healthy(now time.Time) bool {
 	return true
 }
 
+// healthyForModel 在 healthy 基础上再过滤模型级冷却。
+// model 为空时退化为 healthy（保持旧调用点行为不变）。
+func (e *entry) healthyForModel(now time.Time, model string) bool {
+	if !e.healthy(now) {
+		return false
+	}
+	if model == "" {
+		return true
+	}
+	t, ok := e.modelCool[model]
+	return !ok || !now.Before(t)
+}
+
 // stateFile 持久化格式。
 type accountState struct {
 	Credits        int64     `json:"credits"`
@@ -83,6 +105,7 @@ type accountState struct {
 	LowCredit      bool      `json:"low_credit"`
 	Reason         string    `json:"reason,omitempty"`
 	Until          time.Time `json:"until,omitempty"`
+	ModelCool      map[string]time.Time `json:"model_cooling,omitempty"`
 	LastCheckinOK  bool      `json:"last_checkin_ok,omitempty"`
 	LastCheckinAt  time.Time `json:"last_checkin_at,omitempty"`
 	LastCheckinMsg string    `json:"last_checkin_msg,omitempty"`
@@ -169,28 +192,109 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // Pick 返回 healthy 中积分最高的**非低积分**账号；无可用返回 nil。
 // 低积分账号（lowCredit）仅限通过 PickLowCredit 选取。
 func (p *Pool) Pick() *auth.Auth {
-	return p.pickExcluding(true, nil)
+	return p.pickExcludingForModel(true, nil, "")
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pickExcluding(true, tried)
+	return p.pickExcludingForModel(true, tried, "")
 }
 
 // PickLowCredit 返回 healthy 中积分最高的低积分账号（用于 0 费率模型）；无可用返回 nil。
 func (p *Pool) PickLowCredit() *auth.Auth {
-	return p.pickExcluding(false, nil)
+	return p.pickExcludingForModel(false, nil, "")
 }
 
 // PickExcludingLowCredit 同上，但跳过 tried 中的 uid。
 func (p *Pool) PickExcludingLowCredit(tried map[string]bool) *auth.Auth {
-	return p.pickExcluding(false, tried)
+	return p.pickExcludingForModel(false, tried, "")
 }
 
-// pickExcluding 内部实现。
+// PickForModel 选取对【该模型】可用的账号（过滤模型级冷却）。
+// model 为空时等价于 Pick()。
+func (p *Pool) PickForModel(model string) *auth.Auth {
+	return p.PickExcludingForModel(nil, model)
+}
+
+// PickExcludingForModel 在排除已试账号的基础上，
+// 再排除对该模型处于模型级冷却的账号（429/6004 上游按模型限额时）。
+func (p *Pool) PickExcludingForModel(tried map[string]bool, model string) *auth.Auth {
+	return p.pickExcludingForModel(true, tried, model)
+}
+
+// PickLowCreditForModel 低积分账号池的模型感知版本（用于 0 费率模型）。
+func (p *Pool) PickLowCreditForModel(tried map[string]bool, model string) *auth.Auth {
+	return p.pickExcludingForModel(false, tried, model)
+}
+
+// modelCoolSnapshot 返回仍处于未来的模型级冷却副本（供 Status/持久化使用）。
+// 全部过期或为空时返回 nil，避免 JSON 里出现空对象。
+func modelCoolSnapshot(in map[string]time.Time) map[string]time.Time {
+	if len(in) == 0 {
+		return nil
+	}
+	now := time.Now()
+	out := map[string]time.Time{}
+	for m, t := range in {
+		if now.Before(t) {
+			out[m] = t
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// CooldownModel 只冷却该账号的【该模型】（429/6004 上游按模型限额时），
+// 同号其他模型继续参与选号。返回是否升级为了整号冷却。
+//
+// 升级规则：当该账号同时有 >= 2 个模型处于模型级冷却时，升级为整号冷却
+// （until = 最晚的模型解冻时刻）。
+// 依据：若上游其实是按【账号】计时，逐个模型试探会把账号反复拖入冷却，
+// 不如一次性按账号冷却到最晚时刻；升级后清 errCount 与 modelCool。
+func (p *Pool) CooldownModel(uid, model string, d time.Duration, reason string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	if e.modelCool == nil {
+		e.modelCool = map[string]time.Time{}
+	}
+	e.modelCool[model] = now.Add(d)
+	// 统计仍处于未来的模型级冷却，顺便清理过期条目
+	active, latest := 0, time.Time{}
+	for m, t := range e.modelCool {
+		if !now.Before(t) {
+			delete(e.modelCool, m)
+			continue
+		}
+		active++
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	escalated := false
+	if active >= 2 {
+		e.until = latest
+		e.reason = reason + "（多模型接连限流，升级整号冷却）"
+		e.errCount = 0
+		e.modelCool = nil
+		escalated = true
+	}
+	p.saveLocked()
+	return escalated
+}
+
+// pickExcludingForModel 选号核心：在 healthy 基础上再按模型过滤。
 //   - excludeLowCredit=true  → 排除低积分账号（用于付费模型）
 //   - excludeLowCredit=false → 只从低积分账号中选（用于 0 费率模型）
-func (p *Pool) pickExcluding(excludeLowCredit bool, tried map[string]bool) *auth.Auth {
+//
+// model 为空时 healthyForModel 退化为 healthy，行为与旧版一致。
+func (p *Pool) pickExcludingForModel(excludeLowCredit bool, tried map[string]bool, model string) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
@@ -199,7 +303,7 @@ func (p *Pool) pickExcluding(excludeLowCredit bool, tried map[string]bool) *auth
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !e.healthy(now) {
+		if !e.healthyForModel(now, model) {
 			continue
 		}
 		if excludeLowCredit && e.lowCredit {
@@ -405,6 +509,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Disabled:       e.disabled,
 		LowCredit:      e.lowCredit,
 		ErrCount:       e.errCount,
+		ModelCooling:   modelCoolSnapshot(e.modelCool),
 		LastCheckinOK:  e.lastCheckinOK,
 		LastCheckinAt:  e.lastCheckinAt,
 		LastCheckinMsg: e.lastCheckinMsg,
@@ -432,6 +537,7 @@ func (p *Pool) load() {
 			lowCredit:      s.LowCredit,
 			reason:         s.Reason,
 			until:          s.Until,
+			modelCool:      modelCoolSnapshot(s.ModelCool),
 			lastCheckinOK:  s.LastCheckinOK,
 			lastCheckinAt:  s.LastCheckinAt,
 			lastCheckinMsg: s.LastCheckinMsg,
@@ -451,6 +557,7 @@ func (p *Pool) saveLocked() {
 			LowCredit:      e.lowCredit,
 			Reason:         e.reason,
 			Until:          e.until,
+			ModelCool:      modelCoolSnapshot(e.modelCool),
 			LastCheckinOK:  e.lastCheckinOK,
 			LastCheckinAt:  e.lastCheckinAt,
 			LastCheckinMsg: e.lastCheckinMsg,
