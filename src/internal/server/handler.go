@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rockswang/workbuddy-wild/internal/ledger"
+	"github.com/rockswang/workbuddy-wild/internal/stats"
 	"io"
 	"log"
 	"net/http"
@@ -35,6 +37,12 @@ type Runtime struct {
 type Config struct {
 	Runtimes map[provider.Kind]*Runtime
 	APIKey   string // 空 = 不鉴权
+
+	// Stats 运行统计引擎 / Ledger 双流水账本（由 svc.Runtime 初始化后传入）。
+	// 两者是**旁路能力**，可能为 nil（初始化失败时降级），
+	// 消费处必须先判空（见 h.stats / h.ledger）。
+	Stats  *stats.Stats
+	Ledger *ledger.Ledger
 
 	// 兼容旧调用方：只传 Pool/Upstream 时等价于只启用 workbuddy。
 	Pool     *pool.Pool
@@ -125,6 +133,8 @@ func NewHandler(cfg Config) *Handler {
 		h.setAccountEnabled(w, r, false)
 	}))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.mux.HandleFunc("GET /api/stats", h.withAuth(h.statsSnapshot))
+	h.mux.HandleFunc("GET /api/ledger", h.withAuth(h.ledgerQuery))
 	return h
 }
 
@@ -145,12 +155,15 @@ func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
 // pickWithSticky 粘性路由选择账号。
 // freeModel=false 表示付费模型：仅高积分（非低积分）账号可用。
 // freeModel=true  表示 0 费率模型：高积分与低积分账号均可用，优先选取低积分账号，
-//                  无低积分账号时回退到高积分账号。
+//
+//	无低积分账号时回退到高积分账号。
+//
 // model 为本次请求的模型键；用于过滤【模型级冷却】（429/6004 上游按模型限额时，
 // 该账号可能只对某些模型冷却、对其他模型仍可用 —— 见 Pool.CooldownModel）。
 // 优先使用上次成功路由的账号，直到：
 //   - 账号进入冷却/禁用/未被当前模型模式允许/对该模型处于模型级冷却
 //   - 连续成功请求达到 maxReqs 次（默认 50），自动轮换
+//
 // 任一条件触发则降级选新账号并重置粘性记录。
 func (h *Handler) pickWithSticky(rt *Runtime, freeModel bool, model string) *auth.Auth {
 	const defaultMaxReqs = 50
@@ -654,8 +667,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //   - 流式透传中途发现的上游错误（Stream 嗅探出 *provider.Error，H3）
 //
 // 后者此前会被完全忽略（`_ = Stream(...)`），导致：
-//   1. 账号仍被标记为健康（NoteSuccess 在 Stream 之前调用）；
-//   2. 后续请求继续选中这个实际不可用的账号。
+//  1. 账号仍被标记为健康（NoteSuccess 在 Stream 之前调用）；
+//  2. 后续请求继续选中这个实际不可用的账号。
 //
 // freeModel 表示本次请求是否为 0 费率（免费）模型，用于区分「免费额度用完」的
 // 惩罚力度：免费模型失败只需换号重试，不该把账号冷却到次日。
@@ -878,10 +891,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // transparentError 把上游响应【原样】回写给客户端（保留上游 status 与 body）。
 //
 // 用于两类场景（移植自上游 wild-work PR #82 的思路）：
-//   1. 请求级错误（内容拦截 / 上下文超限）：换任何账号都必然复现，
-//      应立刻把上游原文给客户端，而不是轮转到耗尽后包装成 503；
-//   2. 候选全部耗尽：本次确实逐号尝试过，包装成 503 会丢掉上游细节
-//      （如 429 + 6004 重置时间），客户端因此无法知道何时可重试。
+//  1. 请求级错误（内容拦截 / 上下文超限）：换任何账号都必然复现，
+//     应立刻把上游原文给客户端，而不是轮转到耗尽后包装成 503；
+//  2. 候选全部耗尽：本次确实逐号尝试过，包装成 503 会丢掉上游细节
+//     （如 429 + 6004 重置时间），客户端因此无法知道何时可重试。
+//
 // softRateResetMaxCap 解析出的重置时长上限：
 // 上游时间戳异常（如错给一年后）时不至于把号冻死。
 const softRateResetMaxCap = 24 * time.Hour
@@ -962,4 +976,49 @@ func WorkBuddyStaticModels() []provider.ModelInfo {
 }
 func TraeWorkStaticModels() []provider.ModelInfo {
 	return append([]provider.ModelInfo{}, traeworkStaticModels...)
+}
+
+// statsSnapshot 运行统计快照（GET /api/stats）。
+//
+// Stats 为 nil（初始化失败）时返回 503 与明确原因 —— 统计是旁路能力，
+// 不影响代理主流程，接口只是如实告知不可用。
+func (h *Handler) statsSnapshot(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Stats == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "stats_unavailable",
+			"运行统计引擎未初始化（不影响代理转发）")
+		return
+	}
+	writeJSON(w, http.StatusOK, h.cfg.Stats.Snapshot(time.Now()))
+}
+
+// ledgerQuery 双流水账本（GET /api/ledger?days=1|7）。
+//
+// days 非 1 时按 7 天处理（与 ledger.Query 同口径）。
+// Ledger 为 nil 时返回 503。
+//
+// 注意：ledger 与 stats 刻意不合并（上游 R43）—— 差值口径含积分包到期作废，
+// ledger 按 spend/expire 拆分，两套数字天然不同。
+func (h *Handler) ledgerQuery(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Ledger == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "ledger_unavailable",
+			"账本未初始化（不影响代理转发）")
+		return
+	}
+	days := 7
+	if r.URL.Query().Get("days") == "1" {
+		days = 1
+	}
+	// enrich：uid → (昵称, 渠道)，遍历各渠道池补齐展示信息
+	enrich := func(uid string) (string, string) {
+		for k, rt := range h.cfg.Runtimes {
+			if rt == nil || rt.Pool == nil {
+				continue
+			}
+			if st, ok := rt.Pool.Status(uid); ok {
+				return st.Nickname, k.String()
+			}
+		}
+		return "", ""
+	}
+	writeJSON(w, http.StatusOK, h.cfg.Ledger.Query(days, enrich))
 }

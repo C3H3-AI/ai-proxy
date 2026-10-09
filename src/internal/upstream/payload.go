@@ -8,9 +8,17 @@ package upstream
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/rockswang/workbuddy-wild/internal/sanitize"
 )
 
 // PrepareBody 单 pass 改写；无法解析时原样返回。
+//
+// 末尾再过一遍 sanitize.Messages（对齐上游）：
+// Claude Code / Codex CLI 注入的系统提示模板句会被上游 CodeBuddy 内容审核
+// **逐字精确匹配**拦截（HTTP 400 code=11128 / content_blocked）。
+// 最小改写（换一词）可保留语义又不触发拦截。
+// 降级语义：body 不可解析时原样返回，**绝不阻塞请求**。
 func PrepareBody(src []byte) []byte {
 	if len(src) == 0 {
 		return src
@@ -26,7 +34,7 @@ func PrepareBody(src []byte) []byte {
 	if err != nil {
 		return src
 	}
-	return out
+	return sanitize.Messages(out)
 }
 
 // normalizeRoles 将 OpenAI 的 developer 角色改写为 system。

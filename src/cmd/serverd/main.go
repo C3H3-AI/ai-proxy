@@ -4,8 +4,8 @@
 package main
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -65,6 +65,8 @@ func main() {
 	h := server.NewHandler(server.Config{
 		Runtimes:     runtimes,
 		APIKey:       cfg.APIKey,
+		Stats:        r.Stats,  // 可能为 nil（旁路降级），handler 已判空
+		Ledger:       r.Ledger, // 同上
 		HardCooldown: cfg.HardCreditDur,
 		SoftCooldown: cfg.SoftRateDur,
 		ErrThreshold: cfg.Cooldown.ErrThresh,

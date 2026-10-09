@@ -4,6 +4,8 @@ package svc
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/rockswang/workbuddy-wild/internal/ledger"
+	"github.com/rockswang/workbuddy-wild/internal/stats"
 	"log"
 	"os"
 	"path/filepath"
@@ -40,12 +42,23 @@ type Runtime struct {
 	TraeWorkScheduler  *scheduler.Scheduler
 	QoderScheduler     *scheduler.Scheduler
 
+	// Stats 运行统计引擎（内存实时 + 归档），Ledger 双流水账本。
+	//
+	// 两者刻意独立（上游 R43）：stats 是「今日」实时口径，
+	// ledger 按 spend/expire 拆分的流水；差值含积分包到期作废，
+	// 两套数字天然不同，不合并。
+	//
+	// 初始化失败时为 nil —— 统计是**旁路能力**，绝不能因此阻塞代理主流程。
+	// 所有使用点必须做 nil 判断（见 handler.stats / handler.ledger）。
+	Stats  *stats.Stats
+	Ledger *ledger.Ledger
+
 	// 费率（模型积分倍率）缓存 —— 移植自上游 app.FeesInfo/RefreshPricing。
-	pricingFP     string
-	pricingMu     sync.RWMutex
-	pricingCache  []provider.ModelPricing
+	pricingFP      string
+	pricingMu      sync.RWMutex
+	pricingCache   []provider.ModelPricing
 	pricingFetched time.Time
-	pricingErr    string
+	pricingErr     string
 }
 
 // New 按配置装配多渠道运行时。
@@ -114,6 +127,7 @@ func New(cfg *config.Config) (*Runtime, error) {
 		TraeWorkScheduler:  trSch,
 		QoderScheduler:     qdSch,
 	}
+	rt.initStatsLedger() // 失败仅日志，不阻塞（旁路能力）
 	rt.loadPricing()
 	return rt, nil
 }
@@ -388,4 +402,76 @@ func (r *Runtime) PricingForChannel(channel string) []provider.ModelPricing {
 func (r *Runtime) loadPricing() {
 	r.pricingFP = filepath.Join(filepath.Dir(r.Config.StateFile), "pricing-cache.json")
 	r.loadPricingCache()
+}
+
+// initStatsLedger 初始化运行统计引擎与双流水账本。
+//
+// 两者都是**旁路能力**：初始化失败只记日志并把字段留空（nil），
+// 绝不返回 error 阻塞代理主流程。所有消费点（handler.stats / handler.ledger）
+// 都必须先做 nil 判断。
+func (r *Runtime) initStatsLedger() {
+	dir := filepath.Dir(r.Config.StateFile)
+	if dir == "" || dir == "." {
+		dir = "data"
+	}
+	logf := func(format string, args ...any) { log.Printf(format, args...) }
+
+	if st, err := stats.New(dir, logf); err != nil {
+		log.Printf("stats init failed (旁路降级，代理不受影响): %v", err)
+	} else {
+		r.Stats = st
+		// 每 60s 喂一次账号快照差值；进程内已有 5s 落盘。
+		go r.statsPollLoop()
+	}
+
+	if lg, err := ledger.New(filepath.Join(dir, "ledger")); err != nil {
+		log.Printf("ledger init failed (旁路降级，代理不受影响): %v", err)
+	} else {
+		r.Ledger = lg
+	}
+}
+
+// statsPollLoop 周期把各渠道账号快照喂给统计引擎。
+func (r *Runtime) statsPollLoop() {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		r.ApplyStatsPoll()
+	}
+}
+
+// ApplyStatsPoll 聚合三个渠道的账号状态喂给统计引擎；Stats 为 nil 时安全返回。
+func (r *Runtime) ApplyStatsPoll() {
+	if r.Stats == nil {
+		return
+	}
+	now := time.Now()
+	var list []stats.Account
+	for _, k := range []provider.Kind{provider.WorkBuddy, provider.TraeWork, provider.Qoder} {
+		p := r.Pool(k)
+		if p == nil {
+			continue
+		}
+		for _, s := range p.List() {
+			until := ""
+			if !s.Until.IsZero() {
+				until = s.Until.Format(time.RFC3339) // 字典序即时间序
+			}
+			list = append(list, stats.Account{
+				UID:      s.UID,
+				Group:    k.String(),
+				Nickname: s.Nickname,
+				Credits:  s.Credits,
+				Cooling:  s.Cooling,
+				Disabled: s.Disabled,
+				Reason:   s.Reason,
+				Until:    until,
+				ErrCount: s.ErrCount,
+			})
+		}
+	}
+	if len(list) == 0 {
+		return // 空切片会跳过本轮基线，不调用以免清空
+	}
+	r.Stats.ApplyPoll(list, now)
 }
