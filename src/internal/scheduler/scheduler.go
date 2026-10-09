@@ -39,7 +39,12 @@ type Scheduler struct {
 
 // New 构建。
 func New(cfg Config) *Scheduler {
-	if len(cfg.CheckinMinutes) == 0 {
+	// 区分 nil（未配置 → 用默认）与 []int{}（显式声明「本渠道不签到」）：
+	//
+	// 无签到活动的渠道（如 qoder）需传 CheckinMinutes: []int{} 才能真正停掉定时任务。
+	// 此前用 len()==0 判断，会把显式的空切片也兜底成默认时刻，
+	// 导致这些渠道每天白跑两次注定失败的签到（qoder 上游无签到接口）。
+	if cfg.CheckinMinutes == nil {
 		if len(cfg.CheckinHours) > 0 {
 			cfg.CheckinMinutes = make([]int, 0, len(cfg.CheckinHours))
 			for _, h := range cfg.CheckinHours {
@@ -51,7 +56,7 @@ func New(cfg Config) *Scheduler {
 			cfg.CheckinMinutes = []int{0, 9 * 60, 21 * 60}
 		}
 	}
-	if len(cfg.KeepaliveHours) == 0 {
+	if cfg.KeepaliveHours == nil {
 		cfg.KeepaliveHours = []int{22}
 	}
 	return &Scheduler{cfg: cfg, wake: make(chan struct{}, 1)}
@@ -201,6 +206,17 @@ func nextFireMinutes(now time.Time, minutes []int) time.Time {
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		ch, kh := s.schedule()
+		// 该渠道无任何定时任务（CheckinMinutes/KeepaliveHours 均为显式空切片）：
+		// 直接阻塞等取消或配置变更。此时 nextFireMinutes 返回零值，
+		// 若不拦住会退化成每分钟唤醒一次的空转。
+		if len(ch) == 0 && len(kh) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.wake:
+			}
+			continue
+		}
 		all := append(append([]int{}, ch...), hoursToMinutes(kh)...)
 		next := nextFireMinutes(time.Now(), all)
 		timer := time.NewTimer(time.Until(next))

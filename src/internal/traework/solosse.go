@@ -62,8 +62,18 @@ func (e *SOLOStreamError) Error() string {
 
 // Kind 将 SSE 流内错误分类。1005 → provider.ErrHardCredit；其余归 provider.ErrClient。
 func (e *SOLOStreamError) Kind() provider.ErrKind {
-	if e.Code == 1005 {
+	switch e.Code {
+	case 1005:
+		// 权益/余额不足 → 硬冷却
 		return provider.ErrHardCredit
+	case 1001:
+		// 模型不可用 → 按模型避让（请求级，不罚账号整体）
+		return provider.ErrModelBlocked
+	case 3004, 9074:
+		// 上游限流 → 软冷却换号。
+		// 对齐上游映射：3004/9074 若不识别会落到 ErrClient（罚账号+计错），
+		// 而它们实际只是限流，应短冷却后换号。
+		return provider.ErrSoftRate
 	}
 	return provider.ErrClient
 }
@@ -346,8 +356,30 @@ func sortInts(a []int) {
 
 // Stream 流式转换：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
+// Stream 流式转发。
+//
+// 流内业务错误（event:error）不能伪装成正常收尾：此前只把错误描述写进
+// delta.content 并补 [DONE]，导致
+//  1. 客户端把失败的流当成完整回答（半截内容 + 正常结束）；
+//  2. handler 收不到 error，账号**不会**被记入失败状态 ——
+//     多账号聚合里该账号会继续被选中并再次失败。
+//
+// 现在改为：以 OpenAI 规范 error 帧收尾（**不补 [DONE]**），
+// 并把错误按 Kind() 分类返回给 handler，由它更新账号池状态。
 func Stream(w http.ResponseWriter, r io.Reader) error {
-	return streamOpts(w, r, nil)
+	var upErr *SOLOStreamError
+	err := streamOpts(w, r, func(se *SOLOStreamError) { upErr = se })
+	if err != nil {
+		return err
+	}
+	if upErr != nil {
+		return &provider.Error{
+			Kind:   upErr.Kind(),
+			Status: http.StatusOK, // 响应头已发出（200），仅用于分类
+			Msg:    upErr.Error(),
+		}
+	}
+	return nil
 }
 
 // StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil），
@@ -459,20 +491,29 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 				}
 				sawDone = true
 			case "error":
-				// 上游 SOLO 业务错误（1005 权益/1001 模型不可用等）：
-				// 以标准 OpenAI SSE chunk 的 delta.content 返回错误描述，
-				// finish_reason 设为 error 避免客户端持续等待。
+				// 上游 SOLO 业务错误（1005 权益/1001 模型不可用/3004 限流等）。
+				//
+				// 以 OpenAI 规范 error 帧收尾，让客户端明确判失败；
+				// **刻意不补 [DONE]** —— 补了会被当成正常结束，
+				// 客户端把半截回答当完整回答继续跑（正是本修复要消灭的症状）。
 				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
 				if onErr != nil {
 					onErr(se)
 				}
-				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
-				if err := writeChunk(map[string]any{"content": msg}, "stop"); err != nil {
+				errFrame, _ := json.Marshal(map[string]any{
+					"error": map[string]any{
+						"message": se.Error(),
+						"type":    "upstream_error",
+						"code":    fmt.Sprintf("solo_%d", ev.ErrorCode),
+					},
+				})
+				if _, err := io.WriteString(w, "data: "+string(errFrame)+"\n\n"); err != nil {
 					return err
 				}
-				if err := writeDONE(); err != nil {
-					return err
+				if fl != nil {
+					fl.Flush()
 				}
+				// 标记已收尾，避免下面的兜底再补一个 [DONE]
 				sawDone = true
 			}
 		}
