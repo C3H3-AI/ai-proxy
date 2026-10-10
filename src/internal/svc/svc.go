@@ -80,16 +80,19 @@ func New(cfg *config.Config) (*Runtime, error) {
 
 	wbPool := pool.New(filepath.Join(stateDir, "state-workbuddy.json"))
 	wbPool.SetLowCredits(cfg.LowCreditThreshold)
+	wbPool.SetReserveCredits(cfg.ReserveCredits)
 	for _, a := range wbAuths {
 		wbPool.Add(a)
 	}
 	trPool := pool.New(filepath.Join(stateDir, "state-traework.json"))
 	trPool.SetLowCredits(cfg.LowCreditThreshold)
+	trPool.SetReserveCredits(cfg.ReserveCredits)
 	for _, a := range trAuths {
 		trPool.Add(a)
 	}
 	qdPool := pool.New(filepath.Join(stateDir, "state-qoder.json"))
 	qdPool.SetLowCredits(cfg.LowCreditThreshold)
+	qdPool.SetReserveCredits(cfg.ReserveCredits)
 	for _, a := range qdAuths {
 		qoder.EnsureFingerprint(a) // 老凭证补机器指纹
 		qdPool.Add(a)

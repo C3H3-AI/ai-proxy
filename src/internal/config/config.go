@@ -97,6 +97,10 @@ type Config struct {
 	// LowCreditThreshold 低积分阈值：账号积分低于该值时自动冷却到次日（reason=low_credits），
 	// 可手工解锁。<=0 关闭该特性。默认 10。
 	LowCreditThreshold int64 `json:"low_credit_threshold"`
+	// ReserveCredits 积分保留线：付费请求只从「积分 > 该值」的账号中选，
+	// 余额落到保留线的账号退出付费轮转、留作底仓；0 费率模型仍可用它。
+	// 0 表示关闭（全部积分参与轮转，即旧行为）。
+	ReserveCredits int64 `json:"reserve_credits"`
 
 	Cooldown struct {
 		HardCredit  string `json:"hard_credit"`   // "12h"
@@ -137,6 +141,7 @@ func Default() *Config {
 		Region:    "cn",
 	}
 	c.LowCreditThreshold = 10
+	c.ReserveCredits = 0 // 默认关闭（保持旧行为，不影响现有用户）
 	c.Cooldown.HardCredit = "12h"
 	c.Cooldown.SoftRate = "60s"
 	c.Cooldown.ErrThresh = 3

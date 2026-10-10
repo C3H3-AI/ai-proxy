@@ -1,8 +1,8 @@
 package pool
 
 import (
-	"log"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,31 +36,31 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID            string    `json:"uid"`
-	Nickname       string    `json:"nickname,omitempty"`
-	Credits        int64     `json:"credits"`
-	Cooling        bool      `json:"cooling"`
-	Until          time.Time `json:"until,omitempty"`
-	Reason         string    `json:"reason,omitempty"`
-	Disabled       bool      `json:"disabled"`
-	LowCredit      bool      `json:"low_credit"` // 积分低于阈值，仅限 0 费率模型
-	ErrCount       int       `json:"err_count,omitempty"`
+	UID       string    `json:"uid"`
+	Nickname  string    `json:"nickname,omitempty"`
+	Credits   int64     `json:"credits"`
+	Cooling   bool      `json:"cooling"`
+	Until     time.Time `json:"until,omitempty"`
+	Reason    string    `json:"reason,omitempty"`
+	Disabled  bool      `json:"disabled"`
+	LowCredit bool      `json:"low_credit"` // 积分低于阈值，仅限 0 费率模型
+	ErrCount  int       `json:"err_count,omitempty"`
 	// ModelCooling 账号在个别模型上的独立冷却（429/6004 按模型限，账号整体仍可用）。
 	// 仅包含仍处于未来的条目；空 = 无模型级冷却。供路由过滤与面板展示。
 	ModelCooling   map[string]time.Time `json:"model_cooling,omitempty"`
-	LastCheckinOK  bool      `json:"last_checkin_ok,omitempty"`
-	LastCheckinAt  time.Time `json:"last_checkin_at,omitempty"`
-	LastCheckinMsg string    `json:"last_checkin_msg,omitempty"`
+	LastCheckinOK  bool                 `json:"last_checkin_ok,omitempty"`
+	LastCheckinAt  time.Time            `json:"last_checkin_at,omitempty"`
+	LastCheckinMsg string               `json:"last_checkin_msg,omitempty"`
 }
 
 type entry struct {
-	a        *auth.Auth
-	credits  int64
-	disabled bool
+	a         *auth.Auth
+	credits   int64
+	disabled  bool
 	lowCredit bool // 积分低于阈值，仅限 0 费率模型
-	reason   string
-	until    time.Time
-	errCount int
+	reason    string
+	until     time.Time
+	errCount  int
 	// modelCool 模型级冷却：model → 解冻时刻。
 	//
 	// 429/6004 上游常按【模型】限额（响应里会提示"您也可以切换其他模型继续使用"），
@@ -100,15 +100,15 @@ func (e *entry) healthyForModel(now time.Time, model string) bool {
 
 // stateFile 持久化格式。
 type accountState struct {
-	Credits        int64     `json:"credits"`
-	Disabled       bool      `json:"disabled"`
-	LowCredit      bool      `json:"low_credit"`
-	Reason         string    `json:"reason,omitempty"`
-	Until          time.Time `json:"until,omitempty"`
+	Credits        int64                `json:"credits"`
+	Disabled       bool                 `json:"disabled"`
+	LowCredit      bool                 `json:"low_credit"`
+	Reason         string               `json:"reason,omitempty"`
+	Until          time.Time            `json:"until,omitempty"`
 	ModelCool      map[string]time.Time `json:"model_cooling,omitempty"`
-	LastCheckinOK  bool      `json:"last_checkin_ok,omitempty"`
-	LastCheckinAt  time.Time `json:"last_checkin_at,omitempty"`
-	LastCheckinMsg string    `json:"last_checkin_msg,omitempty"`
+	LastCheckinOK  bool                 `json:"last_checkin_ok,omitempty"`
+	LastCheckinAt  time.Time            `json:"last_checkin_at,omitempty"`
+	LastCheckinMsg string               `json:"last_checkin_msg,omitempty"`
 }
 
 type stateFile struct {
@@ -123,6 +123,19 @@ type Pool struct {
 	// lowCredits 低积分阈值：积分低于该值时标记 lowCredit，仅限使用 0 费率模型。
 	// <=0 表示关闭该特性。默认 10。
 	lowCredits int64
+
+	// reserveCredits 积分保留线：付费请求只从「积分 > 保留线」的账号中选，
+	// 余额已落到保留线的账号退出付费轮转，作为底仓留存。
+	//
+	// 与 lowCredits 的区别（两者独立、可各自开关）：
+	//   - lowCredits   ：余额低于阈值 → 冷却到次日等人工/签到恢复，可手工解锁
+	//   - reserveCredits：余额 <= 保留线 → 只是不参与**付费**选号，
+	//                     0 费率（免费）模型仍可用它
+	//
+	// 用途：多账号池里给每个账号留一点底仓，避免被单次高消耗请求打空
+	// （也顺带避免积分到期作废 —— 前提是能拿到到期日）。
+	// <=0 表示关闭（保留全部积分参与轮转，即旧行为）。
+	reserveCredits int64
 }
 
 // New 构建池；stateFp 非空时尝试加载旧状态。
@@ -139,6 +152,18 @@ func (p *Pool) SetLowCredits(v int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.lowCredits = v
+}
+
+// SetReserveCredits 设置积分保留线（<=0 关闭）。
+//
+// 立即生效：下一次选号即生效，无需重启 —— 底仓语义要求「改完立刻按新线轮转」。
+func (p *Pool) SetReserveCredits(v int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v < 0 {
+		v = 0
+	}
+	p.reserveCredits = v
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证。
@@ -299,6 +324,9 @@ func (p *Pool) pickExcludingForModel(excludeLowCredit bool, tried map[string]boo
 	defer p.mu.RUnlock()
 	now := time.Now()
 	var best *entry
+	// fallback 记录「被保留线挡下」的候选：全部账号都落到保留线时，
+	// 宁可消耗底仓也不要让用户完全不可用（底仓只是尽量留存，不是硬性隔离）。
+	var fallback *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -312,9 +340,20 @@ func (p *Pool) pickExcludingForModel(excludeLowCredit bool, tried map[string]boo
 		if !excludeLowCredit && !e.lowCredit {
 			continue
 		}
+		// 付费选号：余额已落到保留线的账号退出轮转，留作底仓。
+		// 仅作用于付费模型（excludeLowCredit=true）；免费模型仍可用它。
+		if excludeLowCredit && p.reserveCredits > 0 && e.credits <= p.reserveCredits {
+			if fallback == nil || e.credits > fallback.credits {
+				fallback = e
+			}
+			continue
+		}
 		if best == nil || e.credits > best.credits {
 			best = e
 		}
+	}
+	if best == nil {
+		best = fallback
 	}
 	if best == nil {
 		return nil
@@ -359,6 +398,7 @@ func (p *Pool) Disable(uid, reason string) {
 //   - remain > 0 → 解除冷却（健康）；
 //   - remain >= 0 且 remain < 低积分阈值 → 标记 lowCredit（仅限 0 费率模型），
 //     否则清除 lowCredit 标记。
+//
 // remain < 0（查询失败）时保留现有状态。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	p.mu.Lock()
