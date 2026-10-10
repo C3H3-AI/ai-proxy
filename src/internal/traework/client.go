@@ -556,9 +556,13 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 				}
 				PackageName string `json:"package_name"`
 				PackageType string `json:"package_type"`
-				// EntitlementID 上游条目稳定标识，供 ledger 差分对账；
-				// 月周期切换时旧键消失、同余额挂新键，没有它就无法区分
-				// 「条目到期」与「条目改名」。
+				// EntitlementID 上游条目稳定标识（如 "checkin_20261010_<uid>"、
+				// "free_utc202610_<uid>"），供 ledger 差分对账。
+				//
+				// ⚠️ 它在 **entitlement_base_info 内层**，不是外层 ——
+				// 早先误放在外层，导致解析恒为空、差分退回 Name 伪键；
+				// 而 Name 伪键在「同名录包的相邻两天」（如两条都叫"签到奖励"）
+				// 会撞键，把周期切换误判成条目变动。
 				EntitlementID string `json:"entitlement_id"`
 			} `json:"entitlement_base_info"`
 			DisplayDesc string `json:"display_desc"`
