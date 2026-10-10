@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/rockswang/workbuddy-wild/internal/ledger"
 	"log"
 	"sort"
 	"strings"
@@ -26,6 +27,11 @@ type Config struct {
 	CheckinHours   []int  // 旧配置兼容，整点小时
 	CheckinMinutes []int  // 当天分钟数，优先于 CheckinHours
 	KeepaliveHours []int  // 默认 [22]
+
+	// Ledger 双流水账本（可选；nil 时跳过记账，不影响签到主流程）。
+	// 签到后把「本次权益明细」喂给它做差分记账（earn/spend/expire），
+	// 这是账本唯一的真实数据来源 —— 只移植包而没人喂，流水会恒空。
+	Ledger *ledger.Ledger
 }
 
 // Scheduler 调度器。
@@ -336,8 +342,11 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 		r.OK = true
 		r.Msg = "ok"
 	}
-	// 无论签到成败都查余额（已签到等业务错误下余额刷新仍有效）
-	remain, rerr := s.cfg.Upstream.UserResource(a)
+	// 无论签到成败都查余额（已签到等业务错误下余额刷新仍有效）。
+	//
+	// 用 UserResourceDetail 而不是 UserResource：多拿到「权益明细（含到期日/标识）」，
+	// 供账本差分记账区分「到期作废」与「正常消耗」—— 开销相同（同为一次请求）。
+	remain, items, rerr := s.cfg.Upstream.UserResourceDetail(a)
 	if rerr != nil {
 		log.Printf("checkin credits failed platform=%s uid=%s err=%v", name, uid, rerr)
 		r.OK = false // 签到后的积分确认失败，整次操作向 GUI 报告失败
@@ -350,6 +359,13 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 		r.Remain, r.HasRemain = remain, true
 		log.Printf("checkin credits platform=%s uid=%s remain=%d", name, uid, remain)
 		s.cfg.Pool.ReenableIfCredits(uid, remain)
+		// 喂账本：差分出 earn（发放）/ spend（消耗）/ expire（到期作废）
+		if lg := s.cfg.Ledger; lg != nil {
+			n := lg.DiffCredits(name, uid, remain, ledger.FromProviderItems(items))
+			if n > 0 {
+				log.Printf("ledger diff platform=%s uid=%s events=%d", name, uid, n)
+			}
+		}
 	}
 	s.cfg.Pool.RecordCheckin(uid, r.OK, r.Msg)
 	s.notifyCheckin(r)
