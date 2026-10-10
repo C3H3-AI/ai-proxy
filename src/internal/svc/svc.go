@@ -107,10 +107,14 @@ func New(cfg *config.Config) (*Runtime, error) {
 		return nil, fmt.Errorf("parse checkin times: %w", err)
 	}
 
-	wbSch := scheduler.New(scheduler.Config{Pool: wbPool, Upstream: wbUp, Name: "workbuddy", CheckinMinutes: minutes, KeepaliveHours: cfg.Schedule.KeepaliveHours})
-	trSch := scheduler.New(scheduler.Config{Pool: trPool, Upstream: trUp, Name: "traework", CheckinMinutes: minutes, KeepaliveHours: cfg.Schedule.KeepaliveHours})
+	// 账本先于调度器初始化：调度器签到后要把它拿到的权益明细喂给账本做差分记账。
+	// 它是**旁路能力**：初始化失败只记日志、返回 nil，绝不阻塞代理主流程。
+	lg := initLedger(dataDirOf(cfg))
+
+	wbSch := scheduler.New(scheduler.Config{Pool: wbPool, Upstream: wbUp, Name: "workbuddy", CheckinMinutes: minutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
+	trSch := scheduler.New(scheduler.Config{Pool: trPool, Upstream: trUp, Name: "traework", CheckinMinutes: minutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 	// Qoder 无签到活动：调度器只做 token keepalive（每日 refresh 保活）
-	qdSch := scheduler.New(scheduler.Config{Pool: qdPool, Upstream: qdUp, Name: "qoder", CheckinMinutes: []int{}, KeepaliveHours: cfg.Schedule.KeepaliveHours})
+	qdSch := scheduler.New(scheduler.Config{Pool: qdPool, Upstream: qdUp, Name: "qoder", CheckinMinutes: []int{}, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 
 	rt := &Runtime{
 		Config:             cfg,
@@ -126,8 +130,9 @@ func New(cfg *config.Config) (*Runtime, error) {
 		WorkBuddyScheduler: wbSch,
 		TraeWorkScheduler:  trSch,
 		QoderScheduler:     qdSch,
+		Ledger:             lg,
 	}
-	rt.initStatsLedger() // 失败仅日志，不阻塞（旁路能力）
+	rt.initStatsEngine() // 失败仅日志，不阻塞（旁路能力）
 	rt.loadPricing()
 	return rt, nil
 }
@@ -404,31 +409,46 @@ func (r *Runtime) loadPricing() {
 	r.loadPricingCache()
 }
 
-// initStatsLedger 初始化运行统计引擎与双流水账本。
+// initStatsEngine 初始化运行统计引擎。
 //
-// 两者都是**旁路能力**：初始化失败只记日志并把字段留空（nil），
-// 绝不返回 error 阻塞代理主流程。所有消费点（handler.stats / handler.ledger）
-// 都必须先做 nil 判断。
-func (r *Runtime) initStatsLedger() {
-	dir := filepath.Dir(r.Config.StateFile)
-	if dir == "" || dir == "." {
+// 统计是**旁路能力**：初始化失败只记日志并把字段留空（nil），
+// 绝不返回 error 阻塞代理主流程。消费点（handler.statsSnapshot）
+// 必须先做 nil 判断。
+func (r *Runtime) initStatsEngine() {
+	logf := func(format string, args ...any) { log.Printf(format, args...) }
+	st, err := stats.New(dataDirOf(r.Config), logf)
+	if err != nil {
+		log.Printf("stats init failed (旁路降级，代理不受影响): %v", err)
+		return
+	}
+	r.Stats = st
+	// 每 60s 喂一次账号快照差值；进程内已有 5s 落盘。
+	go r.statsPollLoop()
+}
+
+// initLedger 初始化双流水账本（旁路能力，失败返回 nil）。
+//
+// 与 stats 刻意独立（上游 R43）：stats 是「今日」实时口径，
+// ledger 按 spend/expire 拆分流水；差值含积分包到期作废，两套数字天然不同。
+func initLedger(dir string) *ledger.Ledger {
+	if dir == "" {
 		dir = "data"
 	}
-	logf := func(format string, args ...any) { log.Printf(format, args...) }
-
-	if st, err := stats.New(dir, logf); err != nil {
-		log.Printf("stats init failed (旁路降级，代理不受影响): %v", err)
-	} else {
-		r.Stats = st
-		// 每 60s 喂一次账号快照差值；进程内已有 5s 落盘。
-		go r.statsPollLoop()
-	}
-
-	if lg, err := ledger.New(filepath.Join(dir, "ledger")); err != nil {
+	lg, err := ledger.New(filepath.Join(dir, "ledger"))
+	if err != nil {
 		log.Printf("ledger init failed (旁路降级，代理不受影响): %v", err)
-	} else {
-		r.Ledger = lg
+		return nil
 	}
+	return lg
+}
+
+// dataDirOf 返回状态文件所在目录（stats/ledger 落盘位置）。
+func dataDirOf(cfg *config.Config) string {
+	dir := filepath.Dir(cfg.StateFile)
+	if dir == "" || dir == "." {
+		return "data"
+	}
+	return dir
 }
 
 // statsPollLoop 周期把各渠道账号快照喂给统计引擎。
