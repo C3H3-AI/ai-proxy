@@ -61,6 +61,7 @@ DEFAULT_OPTIONS = {
     "keepalive_hours": [22],
     "upstream_timeout": 120,
     "low_credit_threshold": 10,
+    "reserve_credits": 0,
     "auto_models_workbuddy": "",
     "auto_models_traework": "",
     "auto_models_qoder": "",
@@ -223,6 +224,7 @@ def build_config(opts):
         },
         "upstream": {"timeout_seconds": int(opts.get("upstream_timeout", 120))},
         "low_credit_threshold": max(0, int(opts.get("low_credit_threshold", 10))),
+        "reserve_credits": max(0, int(opts.get("reserve_credits", 0))),
         "auto_model": {
             "workbuddy_models": parse_csv_list(opts.get("auto_models_workbuddy", "")),
             "traework_models": parse_csv_list(opts.get("auto_models_traework", "")),
@@ -1806,6 +1808,7 @@ td b,td .num{font-family:var(--mono); font-variant-numeric:tabular-nums; letter-
     <div class="field"><label>连续错误触发阈值</label><input id="f_cooldown_err_threshold" type="number" min="1"></div>
     <div class="field"><label>连续错误冷却时长</label><input id="f_cooldown_err_cooldown" placeholder="如 10m"></div>
     <div class="field"><label>低积分阈值（低于此值自动禁用到次日，可手工解锁；填 0 关闭）</label><input id="f_low_credit_threshold" type="number" min="0"></div>
+    <div class="field"><label>积分保留线（付费请求只用积分大于该值的账号，低于/等于则留作底仓；免费模型仍可用；填 0 关闭）</label><input id="f_reserve_credits" type="number" min="0"></div>
   </div>
   <div class="fsec"><h3>cheapest 模型候选白名单</h3>
     <p class="hint" style="margin:0">请到「模型」页勾选各渠道参与 cheapest（费率最低优先）的候选模型，勾选后点「保存 cheapest 白名单」。全部不勾 = 不限制（0 费率模型始终不参与）。</p>
@@ -2128,12 +2131,12 @@ if(!html)html='<p class="hint" style="text-align:center;padding:12px">没有匹�
 groups.innerHTML=html;}
 
 async function loadSettings(){const d=await api('config');if(d.error){toast(d.error,'err');return;}const o=d.options||{};const set=(id,v)=>document.getElementById(id).value=(v===undefined||v===null)?'':v;
-set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_low_credit_threshold',o.low_credit_threshold);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
+set('f_api_key',o.api_key);set('f_region',o.region);set('f_upstream_timeout',o.upstream_timeout);set('f_cooldown_hard_credit',o.cooldown_hard_credit);set('f_cooldown_soft_rate',o.cooldown_soft_rate);set('f_cooldown_err_threshold',o.cooldown_err_threshold);set('f_cooldown_err_cooldown',o.cooldown_err_cooldown);set('f_low_credit_threshold',o.low_credit_threshold);set('f_reserve_credits',o.reserve_credits);set('f_checkin_times',Array.isArray(o.checkin_times)?o.checkin_times.join(','):o.checkin_times);set('f_keepalive_hours',Array.isArray(o.keepalive_hours)?o.keepalive_hours.join(','):o.keepalive_hours);}
 async function doLogout(){await api('logout',{method:'POST'});location.reload();}
 function showLoginUser(){var u=document.getElementById('loginUser');if(u){u.textContent='已登录: admin';u.style.display='inline-block';}var b=document.getElementById('btnLogout');if(b)b.style.display='inline-block';}
 async function changeLogin(){const u=(document.getElementById('f_webui_user')||{}).value||'';const p=(document.getElementById('f_webui_pass')||{}).value||'';if(!u){toast('请填写登录名','err');return;}const d=await api('change-login',{method:'POST',body:{user:u,pass:p}});toast(d.message||d.error,d.success?'ok':'err');if(d.success){document.getElementById('f_webui_user').value='';document.getElementById('f_webui_pass').value='';}}
 async function saveSettings(){const opt={};const get=id=>document.getElementById(id).value;
-opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
+opt.api_key=get('f_api_key');opt.region=get('f_region');opt.upstream_timeout=get('f_upstream_timeout');opt.cooldown_hard_credit=get('f_cooldown_hard_credit');opt.cooldown_soft_rate=get('f_cooldown_soft_rate');opt.cooldown_err_threshold=get('f_cooldown_err_threshold');opt.cooldown_err_cooldown=get('f_cooldown_err_cooldown');opt.low_credit_threshold=get('f_low_credit_threshold');opt.reserve_credits=get('f_reserve_credits');opt.checkin_times=get('f_checkin_times');opt.keepalive_hours=get('f_keepalive_hours');
 const d=await api('config',{method:'POST',body:{options:opt}});toast(d.message||d.error,d.success?'ok':'err');if(d.success)setTimeout(loadOverview,800);}
 loadOverview(true);showLoginUser();
 // ══ 运行统计（第三个 tab）══════════════════════════════════════
